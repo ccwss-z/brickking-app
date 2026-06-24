@@ -1058,6 +1058,9 @@ function detectGrid(image) {
   const { width, height } = canvas;
   const data = ctx.getImageData(0, 0, width, height).data;
 
+  const regularGrid = detectRegularBoardGrid(data, width, height);
+  if (regularGrid) return regularGrid;
+
   const stride = Math.max(1, Math.floor(Math.max(width, height) / 900));
   let minX = width, minY = height, maxX = 0, maxY = 0, hits = 0;
 
@@ -1090,6 +1093,97 @@ function detectGrid(image) {
     h: maxY - minY + stride * 3
   };
   return tightenGridRect(snapGridByLines(fallback, data, width, height));
+}
+
+function detectRegularBoardGrid(data, width, height) {
+  const verticalScores = boardLineScores(data, width, height, "vertical");
+  const horizontalScores = boardLineScores(data, width, height, "horizontal");
+  const xGrid = bestRegularAxis(verticalScores, COLS, width * 0.075, width * 0.115, 0, width * 0.08);
+  const yGrid = bestRegularAxis(horizontalScores, ROWS, width * 0.075, width * 0.115, height * 0.12, height * 0.38);
+  if (!xGrid || !yGrid) return null;
+
+  const rect = {
+    x: xGrid.start,
+    y: yGrid.start,
+    w: xGrid.end - xGrid.start,
+    h: yGrid.end - yGrid.start,
+    confidence: Math.min(xGrid.confidence, yGrid.confidence)
+  };
+  const cellW = rect.w / COLS;
+  const cellH = rect.h / ROWS;
+  const aspect = cellW / cellH;
+  if (aspect < 0.82 || aspect > 1.18 || rect.confidence < 0.34) return null;
+  return rect;
+}
+
+function boardLineScores(data, width, height, axis) {
+  const scores = [];
+  if (axis === "vertical") {
+    const yStep = Math.max(1, Math.floor(height / 760));
+    const startY = Math.round(height * 0.12);
+    const endY = Math.round(height * 0.94);
+    for (let x = 0; x < width; x++) {
+      let score = 0;
+      for (let y = startY; y <= endY; y += yStep) {
+        const p = (y * width + x) * 4;
+        if (isBoardSeparator(data[p], data[p + 1], data[p + 2])) score++;
+      }
+      scores.push(score);
+    }
+    return smoothScores(scores, 3);
+  }
+
+  const xStep = Math.max(1, Math.floor(width / 560));
+  for (let y = 0; y < height; y++) {
+    let score = 0;
+    for (let x = 0; x < width; x += xStep) {
+      const p = (y * width + x) * 4;
+      if (isBoardSeparator(data[p], data[p + 1], data[p + 2])) score++;
+    }
+    scores.push(score);
+  }
+  return smoothScores(scores, 3);
+}
+
+function bestRegularAxis(scores, divisions, minCell, maxCell, minStart, maxStart) {
+  let best = null;
+  const min = Math.max(8, Math.round(minCell));
+  const max = Math.max(min, Math.round(maxCell));
+  for (let cell = min; cell <= max; cell++) {
+    const startStep = Math.max(1, Math.floor(cell / 35));
+    for (let start = Math.max(0, Math.round(minStart)); start <= Math.round(maxStart); start += startStep) {
+      const end = start + cell * divisions;
+      if (end >= scores.length) continue;
+      const score = regularAxisScore(scores, start, end, divisions);
+      if (!best || score > best.score) {
+        best = { start, end, cell, score };
+      }
+    }
+  }
+  if (!best) return null;
+  const maxScore = Math.max(...scores, 1);
+  return {
+    start: best.start,
+    end: best.end,
+    cell: best.cell,
+    score: best.score,
+    confidence: best.score / maxScore
+  };
+}
+
+function regularAxisScore(scores, start, end, divisions) {
+  const cell = (end - start) / divisions;
+  let score = 0;
+  for (let k = 0; k <= divisions; k++) {
+    const target = Math.round(start + cell * k);
+    const radius = Math.max(2, Math.round(cell * 0.08));
+    let best = 0;
+    for (let i = Math.max(0, target - radius); i <= Math.min(scores.length - 1, target + radius); i++) {
+      best = Math.max(best, scores[i]);
+    }
+    score += best;
+  }
+  return score / (divisions + 1);
 }
 
 function tightenGridRect(rect) {
