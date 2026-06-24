@@ -83,6 +83,7 @@ const els = {
   clearData: $("#clearData"),
   openAtlas: $("#openAtlas"),
   backHome: $("#backHome"),
+  appChrome: $("#appChrome"),
   homeScreen: $("#homeScreen"),
   atlasScreen: $("#atlasScreen"),
   workCanvas: $("#workCanvas"),
@@ -290,6 +291,7 @@ function bindEvents() {
 function showScreen(name) {
   els.homeScreen.classList.toggle("active", name === "home");
   els.atlasScreen.classList.toggle("active", name === "atlas");
+  els.appChrome.hidden = name === "atlas";
 }
 
 function setCanvasMode(name) {
@@ -396,7 +398,9 @@ function renderAtlas() {
   els.atlasPageIndicator.textContent = `${Math.min(state.atlasPage + 1, pages)} / ${pages}`;
   els.atlasPrevPage.disabled = state.atlasPage <= 0;
   els.atlasNextPage.disabled = state.atlasPage >= pages - 1;
-  els.multiSelectButton.textContent = state.selectingTiles ? "完成选择" : "多选删除";
+  els.multiSelectButton.innerHTML = state.selectingTiles ? "<span>✓</span>完成" : "<span>☑</span>多选";
+  els.multiSelectButton.setAttribute("aria-label", state.selectingTiles ? "完成选择" : "多选删除");
+  els.multiSelectButton.title = state.selectingTiles ? "完成选择" : "多选删除";
   els.deleteSelectedButton.hidden = !state.selectingTiles;
   els.deleteSelectedButton.textContent = `删除 ${state.selectedTileIDs.size} 个`;
   els.deleteSelectedButton.disabled = state.selectedTileIDs.size === 0;
@@ -615,7 +619,7 @@ async function prepareScreenshotTileImports(file) {
   const grid = templateGrid || detectGrid(image);
   const rows = templateGrid ? 4 : ROWS;
   const cols = templateGrid ? 5 : COLS;
-  const cells = cellRectsFromGrid(grid, rows, cols);
+  const cells = grid.cells || cellRectsFromGrid(grid, rows, cols);
   const used = new Set(state.atlas.map(entry => normalizeName(entry.name)));
   const drafts = [];
   for (const rect of cells) {
@@ -651,6 +655,10 @@ function detectAtlasTemplateGrid(image) {
   ctx.drawImage(image, 0, 0);
   const { width, height } = canvas;
   const data = ctx.getImageData(0, 0, width, height).data;
+
+  const componentGrid = detectAtlasTemplateByComponents(data, width, height);
+  if (componentGrid) return componentGrid;
+
   const stride = Math.max(1, Math.floor(Math.max(width, height) / 900));
   let minX = width, minY = height, maxX = 0, maxY = 0, hits = 0;
   for (let y = 0; y < height; y += stride) {
@@ -678,6 +686,117 @@ function detectAtlasTemplateGrid(image) {
     h: h + stride * 3
   };
   return tightenGridRect(snapGridByLines(rect, data, width, height));
+}
+
+function detectAtlasTemplateByComponents(data, width, height) {
+  const sampleW = Math.min(520, width);
+  const scale = sampleW / width;
+  const sampleH = Math.max(1, Math.round(height * scale));
+  const mask = new Uint8Array(sampleW * sampleH);
+  for (let y = 0; y < sampleH; y++) {
+    const sourceY = Math.min(height - 1, Math.floor(y / scale));
+    for (let x = 0; x < sampleW; x++) {
+      const sourceX = Math.min(width - 1, Math.floor(x / scale));
+      const p = (sourceY * width + sourceX) * 4;
+      if (isTileInterior(data[p], data[p + 1], data[p + 2]) || isAtlasTileFrame(data[p], data[p + 1], data[p + 2])) {
+        mask[y * sampleW + x] = 1;
+      }
+    }
+  }
+
+  const components = connectedMaskComponents(mask, sampleW, sampleH);
+  const candidates = components
+    .map(box => ({
+      ...box,
+      w: box.maxX - box.minX + 1,
+      h: box.maxY - box.minY + 1,
+      density: box.count / Math.max(1, (box.maxX - box.minX + 1) * (box.maxY - box.minY + 1))
+    }))
+    .filter(box => {
+      const aspect = box.w / Math.max(1, box.h);
+      return box.w >= sampleW * 0.055 &&
+        box.h >= sampleW * 0.055 &&
+        aspect >= 0.68 &&
+        aspect <= 1.28 &&
+        box.density >= 0.22;
+    });
+
+  if (candidates.length < 20) return null;
+  const medianW = median(candidates.map(box => box.w));
+  const medianH = median(candidates.map(box => box.h));
+  const cells = candidates
+    .filter(box => box.w >= medianW * 0.65 && box.w <= medianW * 1.4 && box.h >= medianH * 0.65 && box.h <= medianH * 1.4)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 20)
+    .sort((a, b) => a.minY - b.minY || a.minX - b.minX);
+
+  if (cells.length !== 20) return null;
+  const cellSize = median(cells.map(box => box.w)) / scale;
+  const rects = cells.map(box => {
+    const size = Math.min(box.w / scale, cellSize);
+    return {
+      x: box.minX / scale,
+      y: box.minY / scale,
+      w: size,
+      h: size
+    };
+  }).sort((a, b) => {
+    const rowA = Math.round(a.y / Math.max(1, cellSize * 0.55));
+    const rowB = Math.round(b.y / Math.max(1, cellSize * 0.55));
+    return rowA - rowB || a.x - b.x;
+  });
+
+  const minX = Math.max(0, Math.min(...rects.map(rect => rect.x)));
+  const minY = Math.max(0, Math.min(...rects.map(rect => rect.y)));
+  const maxX = Math.min(width, Math.max(...rects.map(rect => rect.x + rect.w)));
+  const maxY = Math.min(height, Math.max(...rects.map(rect => rect.y + rect.h)));
+  const grid = {
+    x: minX,
+    y: minY,
+    w: Math.max(10, maxX - minX),
+    h: Math.max(10, maxY - minY),
+    cells: rects
+  };
+  const gridRatio = grid.w / Math.max(1, grid.h);
+  if (gridRatio < 1.05 || gridRatio > 1.75) return null;
+  return grid;
+}
+
+function connectedMaskComponents(mask, width, height) {
+  const seen = new Uint8Array(mask.length);
+  const components = [];
+  const stack = [];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const start = y * width + x;
+      if (seen[start] || !mask[start]) continue;
+      let minX = x, maxX = x, minY = y, maxY = y, count = 0;
+      stack.length = 0;
+      stack.push(start);
+      seen[start] = 1;
+      while (stack.length) {
+        const index = stack.pop();
+        const cx = index % width;
+        const cy = Math.floor(index / width);
+        count++;
+        minX = Math.min(minX, cx);
+        maxX = Math.max(maxX, cx);
+        minY = Math.min(minY, cy);
+        maxY = Math.max(maxY, cy);
+        for (let yy = cy - 1; yy <= cy + 1; yy++) {
+          for (let xx = cx - 1; xx <= cx + 1; xx++) {
+            if (xx < 0 || yy < 0 || xx >= width || yy >= height) continue;
+            const next = yy * width + xx;
+            if (seen[next] || !mask[next]) continue;
+            seen[next] = 1;
+            stack.push(next);
+          }
+        }
+      }
+      components.push({ minX, minY, maxX, maxY, count });
+    }
+  }
+  return components;
 }
 
 function cellRectsFromGrid(grid, rows = ROWS, cols = COLS) {
@@ -777,19 +896,25 @@ function drawPreviewToCanvas(canvas, image, grid, rows = ROWS, cols = COLS) {
   ctx.strokeRect(grid.x, grid.y, grid.w, grid.h);
   ctx.strokeStyle = "rgba(255,55,75,.72)";
   ctx.lineWidth = Math.max(1, image.naturalWidth / 900);
-  for (let c = 1; c < cols; c++) {
-    const x = grid.x + grid.w * c / cols;
-    ctx.beginPath();
-    ctx.moveTo(x, grid.y);
-    ctx.lineTo(x, grid.y + grid.h);
-    ctx.stroke();
-  }
-  for (let r = 1; r < rows; r++) {
-    const y = grid.y + grid.h * r / rows;
-    ctx.beginPath();
-    ctx.moveTo(grid.x, y);
-    ctx.lineTo(grid.x + grid.w, y);
-    ctx.stroke();
+  if (grid.cells) {
+    for (const rect of grid.cells) {
+      ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    }
+  } else {
+    for (let c = 1; c < cols; c++) {
+      const x = grid.x + grid.w * c / cols;
+      ctx.beginPath();
+      ctx.moveTo(x, grid.y);
+      ctx.lineTo(x, grid.y + grid.h);
+      ctx.stroke();
+    }
+    for (let r = 1; r < rows; r++) {
+      const y = grid.y + grid.h * r / rows;
+      ctx.beginPath();
+      ctx.moveTo(grid.x, y);
+      ctx.lineTo(grid.x + grid.w, y);
+      ctx.stroke();
+    }
   }
   ctx.restore();
 }
@@ -1177,6 +1302,12 @@ function isTileInterior(r, g, b) {
 
 function isGridLine(r, g, b) {
   return g > 55 && g < 150 && r > 35 && r < 150 && b < 95 && g >= r - 35;
+}
+
+function isAtlasTileFrame(r, g, b) {
+  const greenFrame = g > 70 && g < 155 && r > 35 && r < 140 && b < 90 && g >= r - 20;
+  const shadowFrame = r > 25 && r < 95 && g > 45 && g < 110 && b < 65 && g >= r - 8;
+  return greenFrame || shadowFrame;
 }
 
 function isBrownFrame(r, g, b) {
@@ -1765,6 +1896,12 @@ function roundRect(ctx, x, y, w, h, r) {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function median(values) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
 }
 
 function setStatus(title, text) {
