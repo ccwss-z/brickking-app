@@ -352,6 +352,7 @@ async function atlasEntryFromData(entry, fallbackId, userAdded) {
     image,
     feature,
     pixelFeature: pixelFeatureFromImage(image),
+    iconFeature: iconFeatureFromImage(image),
     userAdded
   };
 }
@@ -368,6 +369,7 @@ async function addAtlasImage(file) {
     image,
     feature: featureFromImage(image),
     pixelFeature: pixelFeatureFromImage(image),
+    iconFeature: iconFeatureFromImage(image),
     userAdded: true
   };
 }
@@ -671,6 +673,7 @@ async function prepareScreenshotTileImports(file) {
       image: tileImage,
       feature: featureFromImage(tileImage),
       pixelFeature: pixelFeatureFromImage(tileImage),
+      iconFeature: iconFeatureFromImage(tileImage),
       selected: false,
       duplicateMode: "rename",
       renameTo: nextAvailableAtlasName(name, used),
@@ -685,12 +688,15 @@ async function prepareScreenshotTileImports(file) {
 }
 
 function insetAtlasCropRect(rect) {
-  const inset = Math.min(7, Math.max(2, Math.min(rect.w, rect.h) * 0.04));
+  const side = Math.min(rect.w, rect.h);
+  const insetX = Math.min(4, Math.max(1, side * 0.015));
+  const insetTop = Math.min(4, Math.max(1, side * 0.012));
+  const insetBottom = Math.min(2, Math.max(0, side * 0.006));
   return {
-    x: rect.x + inset,
-    y: rect.y + inset,
-    w: Math.max(1, rect.w - inset * 2),
-    h: Math.max(1, rect.h - inset * 2)
+    x: rect.x + insetX,
+    y: rect.y + insetTop,
+    w: Math.max(1, rect.w - insetX * 2),
+    h: Math.max(1, rect.h - insetTop - insetBottom)
   };
 }
 
@@ -778,12 +784,16 @@ function detectAtlasTemplateByComponents(data, width, height) {
   if (cells.length !== 20) return null;
   const cellSize = median(cells.map(box => box.w)) / scale;
   const rects = cells.map(box => {
-    const size = Math.min(box.w / scale, cellSize);
+    const pad = Math.max(1, cellSize * 0.012);
+    const x = Math.max(0, box.minX / scale - pad);
+    const y = Math.max(0, box.minY / scale - pad);
+    const w = Math.min(width - x, box.w / scale + pad * 2);
+    const h = Math.min(height - y, box.h / scale + pad * 2);
     return {
-      x: box.minX / scale,
-      y: box.minY / scale,
-      w: size,
-      h: size
+      x,
+      y,
+      w,
+      h
     };
   }).sort((a, b) => {
     const rowA = Math.round(a.y / Math.max(1, cellSize * 0.55));
@@ -1004,6 +1014,7 @@ function saveImportDrafts() {
       image: draft.image,
       feature: draft.feature,
       pixelFeature: draft.pixelFeature || pixelFeatureFromImage(draft.image),
+      iconFeature: draft.iconFeature || iconFeatureFromImage(draft.image),
       userAdded: true
     };
     if (existingIndex >= 0 && draft.duplicateMode === "overwrite") {
@@ -1156,6 +1167,9 @@ function detectGrid(image) {
   const { width, height } = canvas;
   const data = ctx.getImageData(0, 0, width, height).data;
 
+  const centerGrid = detectGridFromTileCenters(image);
+  if (centerGrid) return centerGrid;
+
   const regularGrid = detectRegularBoardGrid(data, width, height);
   if (regularGrid) return regularGrid;
 
@@ -1191,6 +1205,169 @@ function detectGrid(image) {
     h: maxY - minY + stride * 3
   };
   return tightenGridRect(snapGridByLines(fallback, data, width, height));
+}
+
+function detectGridFromTileCenters(image) {
+  const sourceWidth = image.naturalWidth || image.width;
+  const sourceHeight = image.naturalHeight || image.height;
+  const longest = Math.max(sourceWidth, sourceHeight);
+  const scale = longest > 1400 ? 1400 / longest : 1;
+  const width = Math.max(1, Math.round(sourceWidth * scale));
+  const height = Math.max(1, Math.round(sourceHeight * scale));
+  const canvas = makeCanvas(width, height);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "medium";
+  ctx.drawImage(image, 0, 0, width, height);
+  const data = ctx.getImageData(0, 0, width, height).data;
+  const components = tileInteriorComponents(data, width, height);
+  if (components.length < 80) return null;
+
+  const xAxis = bestCenterAxis(components, "x", COLS, width * 0.045, width * 0.13, width);
+  const yAxis = bestCenterAxis(components, "y", ROWS, height * 0.032, height * 0.13, height);
+  if (!xAxis || !yAxis) return null;
+
+  const rect = {
+    x: xAxis.start / scale,
+    y: yAxis.start / scale,
+    w: (xAxis.end - xAxis.start) / scale,
+    h: (yAxis.end - yAxis.start) / scale,
+    confidence: Math.min(xAxis.confidence, yAxis.confidence)
+  };
+  const cellW = rect.w / COLS;
+  const cellH = rect.h / ROWS;
+  const aspect = cellW / Math.max(1, cellH);
+  if (aspect < 0.82 || aspect > 1.18 || rect.confidence < 0.42) return null;
+  if (rect.x < -2 || rect.y < -2 || rect.x + rect.w > sourceWidth + 2 || rect.y + rect.h > sourceHeight + 2) return null;
+  return {
+    x: Math.max(0, rect.x),
+    y: Math.max(0, rect.y),
+    w: Math.min(sourceWidth - Math.max(0, rect.x), rect.w),
+    h: Math.min(sourceHeight - Math.max(0, rect.y), rect.h),
+    confidence: rect.confidence
+  };
+}
+
+function tileInteriorComponents(data, width, height) {
+  const total = width * height;
+  const mask = new Uint8Array(total);
+  for (let i = 0, p = 0; i < total; i++, p += 4) {
+    if (isTileInterior(data[p], data[p + 1], data[p + 2])) mask[i] = 1;
+  }
+
+  const visited = new Uint8Array(total);
+  const stack = new Int32Array(total);
+  const components = [];
+  const minSide = Math.max(10, Math.min(width, height) * 0.018);
+  const maxSide = Math.max(minSide + 2, Math.min(width, height) * 0.16);
+  const minArea = Math.max(90, minSide * minSide * 0.30);
+
+  for (let index = 0; index < total; index++) {
+    if (!mask[index] || visited[index]) continue;
+    let top = 0;
+    stack[top++] = index;
+    visited[index] = 1;
+    let area = 0;
+    let minX = width, minY = height, maxX = 0, maxY = 0;
+
+    while (top > 0) {
+      const current = stack[--top];
+      const x = current % width;
+      const y = Math.floor(current / width);
+      area++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+
+      const left = current - 1;
+      const right = current + 1;
+      const up = current - width;
+      const down = current + width;
+      if (x > 0 && mask[left] && !visited[left]) {
+        visited[left] = 1;
+        stack[top++] = left;
+      }
+      if (x < width - 1 && mask[right] && !visited[right]) {
+        visited[right] = 1;
+        stack[top++] = right;
+      }
+      if (y > 0 && mask[up] && !visited[up]) {
+        visited[up] = 1;
+        stack[top++] = up;
+      }
+      if (y < height - 1 && mask[down] && !visited[down]) {
+        visited[down] = 1;
+        stack[top++] = down;
+      }
+    }
+
+    const w = maxX - minX + 1;
+    const h = maxY - minY + 1;
+    const ratio = w / Math.max(1, h);
+    if (
+      area >= minArea &&
+      w >= minSide &&
+      h >= minSide &&
+      w <= maxSide &&
+      h <= maxSide &&
+      ratio >= 0.55 &&
+      ratio <= 1.45
+    ) {
+      components.push({
+        x: (minX + maxX) / 2,
+        y: (minY + maxY) / 2,
+        area,
+        w,
+        h
+      });
+    }
+  }
+  return components;
+}
+
+function bestCenterAxis(components, axis, divisions, minCell, maxCell, length) {
+  const scores = new Float32Array(length);
+  for (const component of components) {
+    const pos = Math.round(component[axis]);
+    if (pos >= 0 && pos < length) {
+      scores[pos] += Math.min(12, Math.sqrt(component.area));
+    }
+  }
+  const min = Math.max(8, Math.round(minCell));
+  const max = Math.max(min, Math.round(maxCell));
+  let best = null;
+
+  for (let cell = min; cell <= max; cell++) {
+    const radius = Math.max(2, Math.round(cell * 0.16));
+    const startStep = Math.max(1, Math.round(cell / 24));
+    for (let start = 0; start + cell * divisions < length; start += startStep) {
+      let hits = 0;
+      let totalScore = 0;
+      let spreadPenalty = 0;
+      for (let k = 0; k < divisions; k++) {
+        const center = Math.round(start + cell * (k + 0.5));
+        let localBest = 0;
+        let bestDistance = radius + 1;
+        for (let p = Math.max(0, center - radius); p <= Math.min(length - 1, center + radius); p++) {
+          if (scores[p] > localBest) {
+            localBest = scores[p];
+            bestDistance = Math.abs(p - center);
+          }
+        }
+        if (localBest > 0) hits++;
+        totalScore += localBest;
+        spreadPenalty += bestDistance / Math.max(1, radius);
+      }
+      const confidence = hits / divisions;
+      if (confidence < 0.78) continue;
+      const score = totalScore + hits * 18 - spreadPenalty * 2;
+      if (!best || score > best.score) {
+        best = { start, end: start + cell * divisions, cell, score, confidence };
+      }
+    }
+  }
+  return best;
 }
 
 function detectRegularBoardGrid(data, width, height) {
@@ -1572,8 +1749,9 @@ async function recognizeBoard() {
       }
       const feature = featureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
       const pixelFeature = pixelFeatureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
+      const iconFeature = iconFeatureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
       const embedding = state.embeddingModel ? await embeddingFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET) : null;
-      const match = matchAtlas({ feature, pixelFeature, embedding }, atlasEntries);
+      const match = matchAtlas({ feature, pixelFeature, iconFeature, embedding }, atlasEntries);
       if (match) {
         nextBoard.push(match.id);
         nextConfidence.push(Math.max(0, 1 - match.distance / DEFAULT_THRESHOLD));
@@ -1666,6 +1844,7 @@ function isEmptyCell(ctx, rect) {
 function matchAtlas(sample, entries = state.atlas) {
   const feature = Array.isArray(sample) ? sample : sample.feature;
   const pixelFeature = Array.isArray(sample) ? null : sample.pixelFeature;
+  const iconFeature = Array.isArray(sample) ? null : sample.iconFeature;
   const embedding = Array.isArray(sample) ? null : sample.embedding;
   let best = null;
   let second = null;
@@ -1675,14 +1854,19 @@ function matchAtlas(sample, entries = state.atlas) {
     const pixelDistance = pixelFeature && entry.pixelFeature && entry.pixelFeature.length === pixelFeature.length
       ? rms(pixelFeature, entry.pixelFeature)
       : fingerprintDistance;
-    const fallbackDistance = fingerprintDistance * 0.62 + pixelDistance * 0.38;
+    const iconDistance = iconFeature && entry.iconFeature && entry.iconFeature.length === iconFeature.length
+      ? rms(iconFeature, entry.iconFeature)
+      : null;
+    const fallbackDistance = iconDistance == null
+      ? fingerprintDistance * 0.58 + pixelDistance * 0.42
+      : iconDistance * 0.62 + pixelDistance * 0.23 + fingerprintDistance * 0.15;
     const embeddingDistance = embedding && entry.embedding ? cosineDistance(embedding, entry.embedding) : null;
-    const distance = embeddingDistance == null ? fallbackDistance : embeddingDistance * 0.82 + Math.min(1, fallbackDistance) * 0.18;
+    const distance = embeddingDistance == null ? fallbackDistance : Math.min(1, fallbackDistance) * 0.90 + embeddingDistance * 0.10;
     if (!best || distance < best.distance) {
       second = best;
-      best = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance, embeddingDistance };
+      best = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance, iconDistance, embeddingDistance };
     } else if (!second || distance < second.distance) {
-      second = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance, embeddingDistance };
+      second = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance, iconDistance, embeddingDistance };
     }
   }
   if (!best) return null;
@@ -1714,6 +1898,13 @@ function pixelFeatureFromImage(image) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
   return pixelFeatureFromCanvasRegion(ctx, { x: 0, y: 0, w: canvas.width, h: canvas.height }, 0);
+}
+
+function iconFeatureFromImage(image) {
+  const canvas = makeCanvas(image.naturalWidth || image.width || 96, image.naturalHeight || image.height || 96);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return iconFeatureFromCanvasRegion(ctx, { x: 0, y: 0, w: canvas.width, h: canvas.height }, 0);
 }
 
 function pixelFeatureFromCanvasRegion(ctx, rect, insetRatio = 0) {
@@ -1752,6 +1943,100 @@ function pixelFeatureFromCanvasRegion(ctx, rect, insetRatio = 0) {
     }
   }
   return features;
+}
+
+function iconFeatureFromCanvasRegion(ctx, rect, insetRatio = 0) {
+  const cropSize = 64;
+  const featureSize = 24;
+  const insetX = rect.w * insetRatio;
+  const insetY = rect.h * insetRatio;
+  const sourceX = Math.max(0, Math.floor(rect.x + insetX));
+  const sourceY = Math.max(0, Math.floor(rect.y + insetY));
+  const sourceW = Math.max(1, Math.floor(rect.w - insetX * 2));
+  const sourceH = Math.max(1, Math.floor(rect.h - insetY * 2));
+  const crop = makeCanvas(cropSize, cropSize);
+  const cropCtx = crop.getContext("2d", { willReadFrequently: true });
+  cropCtx.imageSmoothingEnabled = true;
+  cropCtx.imageSmoothingQuality = "high";
+  cropCtx.drawImage(ctx.canvas, sourceX, sourceY, sourceW, sourceH, 0, 0, cropSize, cropSize);
+  const cropImage = cropCtx.getImageData(0, 0, cropSize, cropSize);
+
+  let minX = cropSize, minY = cropSize, maxX = -1, maxY = -1, hits = 0;
+  for (let y = 0; y < cropSize; y++) {
+    for (let x = 0; x < cropSize; x++) {
+      const i = (y * cropSize + x) * 4;
+      if (!isIconForegroundPixel(cropImage.data[i], cropImage.data[i + 1], cropImage.data[i + 2])) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+      hits++;
+    }
+  }
+
+  let boxX = Math.round(cropSize * 0.14);
+  let boxY = Math.round(cropSize * 0.12);
+  let boxW = Math.round(cropSize * 0.72);
+  let boxH = Math.round(cropSize * 0.76);
+  if (hits > cropSize * cropSize * 0.025 && maxX > minX && maxY > minY) {
+    const pad = 4;
+    boxX = Math.max(0, minX - pad);
+    boxY = Math.max(0, minY - pad);
+    boxW = Math.min(cropSize - boxX, maxX - minX + 1 + pad * 2);
+    boxH = Math.min(cropSize - boxY, maxY - minY + 1 + pad * 2);
+    const side = Math.max(boxW, boxH);
+    boxX = Math.max(0, Math.min(cropSize - side, boxX - (side - boxW) / 2));
+    boxY = Math.max(0, Math.min(cropSize - side, boxY - (side - boxH) / 2));
+    boxW = Math.min(side, cropSize - boxX);
+    boxH = Math.min(side, cropSize - boxY);
+  }
+
+  const sample = makeCanvas(featureSize, featureSize);
+  const sampleCtx = sample.getContext("2d", { willReadFrequently: true });
+  sampleCtx.imageSmoothingEnabled = true;
+  sampleCtx.imageSmoothingQuality = "high";
+  sampleCtx.fillStyle = "#eef8c8";
+  sampleCtx.fillRect(0, 0, featureSize, featureSize);
+  sampleCtx.drawImage(crop, boxX, boxY, boxW, boxH, 0, 0, featureSize, featureSize);
+  const image = sampleCtx.getImageData(0, 0, featureSize, featureSize);
+  const features = [];
+  const mask = [];
+  const luminance = [];
+  for (let y = 0; y < featureSize; y++) {
+    for (let x = 0; x < featureSize; x++) {
+      const i = (y * featureSize + x) * 4;
+      const r = image.data[i];
+      const g = image.data[i + 1];
+      const b = image.data[i + 2];
+      const foreground = isIconForegroundPixel(r, g, b) ? 1 : 0;
+      mask.push(foreground);
+      luminance.push((r * 0.299 + g * 0.587 + b * 0.114) / 255);
+      features.push((r / 255) * foreground, (g / 255) * foreground, (b / 255) * foreground, foreground);
+    }
+  }
+  for (let y = 0; y < featureSize; y++) {
+    for (let x = 0; x < featureSize; x++) {
+      const center = luminance[y * featureSize + x] * mask[y * featureSize + x];
+      const rightIndex = y * featureSize + Math.min(featureSize - 1, x + 1);
+      const downIndex = Math.min(featureSize - 1, y + 1) * featureSize + x;
+      const right = luminance[rightIndex] * mask[rightIndex];
+      const down = luminance[downIndex] * mask[downIndex];
+      features.push(Math.abs(center - right) * 0.45 + Math.abs(center - down) * 0.45);
+    }
+  }
+  return features;
+}
+
+function isIconForegroundPixel(r, g, b) {
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const saturation = max - min;
+  const tileFace = r >= 178 && g >= 188 && b >= 125 && g >= r - 34 && g >= b + 4;
+  const paleWhite = r >= 218 && g >= 218 && b >= 205 && saturation <= 34;
+  const darkGrid = isGridLine(r, g, b) || isAtlasTileFrame(r, g, b);
+  const softShadow = saturation <= 18 && max < 210;
+  if (tileFace || paleWhite || darkGrid || softShadow) return false;
+  return saturation > 26 || max < 150 || r < 168 || g < 168 || b < 168;
 }
 
 async function ensureAtlasEmbeddings(entries) {
