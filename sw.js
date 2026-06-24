@@ -1,9 +1,9 @@
-const CACHE_NAME = "brickking-pwa-v2-mobile-shell-6";
+const CACHE_NAME = "brickking-pwa-v2-mobile-shell-7";
 const ASSETS = [
   "./",
   "./index.html",
-  "./styles.css?v=20260624-match1",
-  "./app.js?v=20260624-match1",
+  "./styles.css?v=20260624-atlascrop1",
+  "./app.js?v=20260624-atlascrop1",
   "./manifest.webmanifest",
   "./icons/icon-120.png",
   "./icons/icon-152.png",

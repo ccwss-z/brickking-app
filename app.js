@@ -623,7 +623,8 @@ async function prepareScreenshotTileImports(file) {
   const used = new Set(state.atlas.map(entry => normalizeName(entry.name)));
   const drafts = [];
   for (const rect of cells) {
-    const imageData = cropImageToDataURL(image, rect, 120, 120);
+    const cropRect = insetAtlasCropRect(rect);
+    const imageData = cropImageToDataURL(image, cropRect, 120, 120);
     const tileImage = await loadImage(imageData);
     const name = nextAvailableAtlasName("图鉴", used);
     used.add(normalizeName(name));
@@ -647,6 +648,16 @@ async function prepareScreenshotTileImports(file) {
   state.importCutPreview = { drafts, rows, cols };
   renderImportDrafts();
   openModal(els.importReviewModal);
+}
+
+function insetAtlasCropRect(rect) {
+  const inset = Math.min(7, Math.max(2, Math.min(rect.w, rect.h) * 0.04));
+  return {
+    x: rect.x + inset,
+    y: rect.y + inset,
+    w: Math.max(1, rect.w - inset * 2),
+    h: Math.max(1, rect.h - inset * 2)
+  };
 }
 
 function detectAtlasTemplateGrid(image) {
