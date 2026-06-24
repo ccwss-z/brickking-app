@@ -1,7 +1,7 @@
 const ROWS = 14;
 const COLS = 10;
 const CELL_COUNT = ROWS * COLS;
-const DEFAULT_THRESHOLD = 0.235;
+const DEFAULT_THRESHOLD = 0.34;
 const DEFAULT_CATEGORY_ID = "00000000-0000-0000-0000-000000000001";
 const ATLAS_STORAGE_KEY = "brickking-pwa-atlas-v2";
 const ATLAS_PAGE_SIZE = 20;
@@ -1469,9 +1469,9 @@ function recognizeBoard() {
         nextConfidence.push(1);
         continue;
       }
-      const feature = featureFromCanvasRegion(ctx, rect);
+      const feature = featureFromCanvasRegion(ctx, rect, 0.03);
       const match = matchAtlas(feature, atlasEntries);
-      if (match && match.distance <= DEFAULT_THRESHOLD) {
+      if (match) {
         nextBoard.push(match.id);
         nextConfidence.push(Math.max(0, 1 - match.distance / DEFAULT_THRESHOLD));
       } else {
@@ -1506,6 +1506,7 @@ function matchAtlas(feature, entries = state.atlas) {
   let best = null;
   let second = null;
   for (const entry of entries) {
+    if (!entry.feature || entry.feature.length !== feature.length) continue;
     const distance = rms(feature, entry.feature);
     if (!best || distance < best.distance) {
       second = best;
@@ -1515,57 +1516,149 @@ function matchAtlas(feature, entries = state.atlas) {
     }
   }
   if (!best) return null;
+  if (best.distance > DEFAULT_THRESHOLD) return null;
   if (second) {
     const gap = second.distance - best.distance;
     const ratio = best.distance / Math.max(second.distance, 0.0001);
-    if (best.distance > 0.16 && gap < 0.012 && ratio > 0.94) return null;
+    const strongAbsoluteMatch = best.distance <= Math.min(0.20, DEFAULT_THRESHOLD * 0.60);
+    if (!strongAbsoluteMatch && (gap < 0.02 || ratio > 0.94)) return null;
+  } else if (best.distance > Math.min(0.22, DEFAULT_THRESHOLD)) {
+    return null;
   }
   return best;
 }
 
 function featureFromImage(image) {
-  const canvas = makeCanvas(96, 96);
+  const canvas = makeCanvas(image.naturalWidth || image.width || 96, image.naturalHeight || image.height || 96);
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  ctx.drawImage(image, 0, 0, 96, 96);
-  return featureFromCanvasRegion(ctx, { x: 0, y: 0, w: 96, h: 96 });
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return featureFromCanvasRegion(ctx, { x: 0, y: 0, w: canvas.width, h: canvas.height }, 0);
 }
 
-function featureFromCanvasRegion(ctx, rect) {
-  const size = 8;
-  const insetX = rect.w * 0.12;
-  const insetY = rect.h * 0.12;
-  const image = ctx.getImageData(
-    Math.max(0, Math.floor(rect.x + insetX)),
-    Math.max(0, Math.floor(rect.y + insetY)),
-    Math.max(1, Math.floor(rect.w - insetX * 2)),
-    Math.max(1, Math.floor(rect.h - insetY * 2))
-  );
+function featureFromCanvasRegion(ctx, rect, insetRatio = 0) {
+  const size = 12;
+  const insetX = rect.w * insetRatio;
+  const insetY = rect.h * insetRatio;
+  const sourceX = Math.max(0, Math.floor(rect.x + insetX));
+  const sourceY = Math.max(0, Math.floor(rect.y + insetY));
+  const sourceW = Math.max(1, Math.floor(rect.w - insetX * 2));
+  const sourceH = Math.max(1, Math.floor(rect.h - insetY * 2));
+  const canvas = makeCanvas(size, size);
+  const sampleCtx = canvas.getContext("2d", { willReadFrequently: true });
+  sampleCtx.imageSmoothingEnabled = true;
+  sampleCtx.imageSmoothingQuality = "high";
+  sampleCtx.drawImage(ctx.canvas, sourceX, sourceY, sourceW, sourceH, 0, 0, size, size);
+  const image = sampleCtx.getImageData(0, 0, size, size);
   const features = [];
-  for (let gy = 0; gy < size; gy++) {
-    for (let gx = 0; gx < size; gx++) {
-      let sr = 0, sg = 0, sb = 0, count = 0;
-      const x0 = Math.floor(gx * image.width / size);
-      const x1 = Math.floor((gx + 1) * image.width / size);
-      const y0 = Math.floor(gy * image.height / size);
-      const y1 = Math.floor((gy + 1) * image.height / size);
-      for (let y = y0; y < y1; y++) {
-        for (let x = x0; x < x1; x++) {
-          const i = (y * image.width + x) * 4;
-          sr += image.data[i] / 255;
-          sg += image.data[i + 1] / 255;
-          sb += image.data[i + 2] / 255;
-          count++;
-        }
+  const pixelCount = size * size;
+  const luminance = [];
+  const redValues = [];
+  const greenValues = [];
+  const blueValues = [];
+
+  for (let index = 0; index < pixelCount; index++) {
+    const offset = index * 4;
+    const red = image.data[offset] / 255;
+    const green = image.data[offset + 1] / 255;
+    const blue = image.data[offset + 2] / 255;
+    redValues.push(red);
+    greenValues.push(green);
+    blueValues.push(blue);
+    luminance.push(red * 0.299 + green * 0.587 + blue * 0.114);
+  }
+
+  const lumaMean = average(luminance);
+  const lumaStd = Math.max(standardDeviation(luminance, lumaMean), 0.05);
+  const cornerIndices = [0, size - 1, (size - 1) * size, pixelCount - 1];
+  const backgroundRed = average(cornerIndices.map(index => redValues[index]));
+  const backgroundGreen = average(cornerIndices.map(index => greenValues[index]));
+  const backgroundBlue = average(cornerIndices.map(index => blueValues[index]));
+
+  for (let index = 0; index < pixelCount; index++) {
+    features.push(((luminance[index] - lumaMean) / lumaStd) * 0.35);
+    features.push(redValues[index] * 0.25);
+    features.push(greenValues[index] * 0.25);
+    features.push(blueValues[index] * 0.25);
+  }
+
+  const foregroundMask = Array(pixelCount).fill(0);
+  for (let index = 0; index < pixelCount; index++) {
+    const redDelta = redValues[index] - backgroundRed;
+    const greenDelta = greenValues[index] - backgroundGreen;
+    const blueDelta = blueValues[index] - backgroundBlue;
+    const colorDistance = Math.sqrt(redDelta * redDelta + greenDelta * greenDelta + blueDelta * blueDelta);
+    const foreground = Math.min(1, Math.max(0, (colorDistance - 0.07) / 0.22));
+    foregroundMask[index] = foreground;
+    features.push(foreground * 1.05);
+    features.push(redDelta * foreground * 0.85);
+    features.push(greenDelta * foreground * 0.85);
+    features.push(blueDelta * foreground * 0.85);
+  }
+
+  const foregroundIndices = foregroundMask
+    .map((value, index) => (value > 0.20 ? index : -1))
+    .filter(index => index >= 0);
+  if (foregroundIndices.length) {
+    const rows = foregroundIndices.map(index => Math.floor(index / size));
+    const cols = foregroundIndices.map(index => index % size);
+    const minRow = Math.max(0, Math.min(...rows) - 1);
+    const maxRow = Math.min(size - 1, Math.max(...rows) + 1);
+    const minCol = Math.max(0, Math.min(...cols) - 1);
+    const maxCol = Math.min(size - 1, Math.max(...cols) + 1);
+    const boxHeight = Math.max(1, maxRow - minRow + 1);
+    const boxWidth = Math.max(1, maxCol - minCol + 1);
+
+    for (let row = 0; row < size; row++) {
+      for (let col = 0; col < size; col++) {
+        const sourceRow = minRow + Math.min(boxHeight - 1, Math.floor((row + 0.5) * boxHeight / size));
+        const sourceCol = minCol + Math.min(boxWidth - 1, Math.floor((col + 0.5) * boxWidth / size));
+        const sourceIndex = sourceRow * size + sourceCol;
+        const foreground = foregroundMask[sourceIndex];
+        features.push(foreground * 1.35);
+        features.push((redValues[sourceIndex] - backgroundRed) * foreground * 1.15);
+        features.push((greenValues[sourceIndex] - backgroundGreen) * foreground * 1.15);
+        features.push((blueValues[sourceIndex] - backgroundBlue) * foreground * 1.15);
+        features.push(((luminance[sourceIndex] - lumaMean) / lumaStd) * foreground * 0.45);
       }
-      const r = sr / Math.max(1, count);
-      const g = sg / Math.max(1, count);
-      const b = sb / Math.max(1, count);
-      const max = Math.max(r, g, b);
-      const min = Math.min(r, g, b);
-      features.push(r, g, b, max - min);
+    }
+  } else {
+    features.push(...Array(pixelCount * 5).fill(0));
+  }
+
+  for (let row = 0; row < size; row++) {
+    for (let col = 0; col < size; col++) {
+      const center = luminance[row * size + col];
+      const right = col + 1 < size ? luminance[row * size + col + 1] : center;
+      const down = row + 1 < size ? luminance[(row + 1) * size + col] : center;
+      features.push((Math.abs(center - right) + Math.abs(center - down)) * 0.70);
     }
   }
+
+  features.push(...colorHistogram(redValues, 8));
+  features.push(...colorHistogram(greenValues, 8));
+  features.push(...colorHistogram(blueValues, 8));
   return features;
+}
+
+function average(values) {
+  return values.reduce((sum, value) => sum + value, 0) / Math.max(1, values.length);
+}
+
+function standardDeviation(values, mean = average(values)) {
+  const variance = values.reduce((sum, value) => {
+    const delta = value - mean;
+    return sum + delta * delta;
+  }, 0) / Math.max(1, values.length);
+  return Math.sqrt(variance);
+}
+
+function colorHistogram(values, bins) {
+  const histogram = Array(bins).fill(0);
+  for (const value of values) {
+    const index = Math.min(bins - 1, Math.max(0, Math.floor(value * bins)));
+    histogram[index] += 1;
+  }
+  return histogram.map(value => value / Math.max(1, values.length));
 }
 
 function renderBoard(container, board, options = {}) {
