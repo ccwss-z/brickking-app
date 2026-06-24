@@ -2,6 +2,7 @@ const ROWS = 14;
 const COLS = 10;
 const CELL_COUNT = ROWS * COLS;
 const DEFAULT_THRESHOLD = 0.34;
+const ANALYSIS_FEATURE_INSET = 0.07;
 const DEFAULT_CATEGORY_ID = "00000000-0000-0000-0000-000000000001";
 const ATLAS_STORAGE_KEY = "brickking-pwa-atlas-v2";
 const ATLAS_PAGE_SIZE = 20;
@@ -228,6 +229,7 @@ function bindEvents() {
     state.atlas = state.atlas.filter(entry => !state.selectedTileIDs.has(entry.uuid));
     state.selectedTileIDs.clear();
     state.selectingTiles = false;
+    normalizeAtlasNumericIDs();
     clampAtlasPage();
     persistAtlas();
     renderAtlas();
@@ -326,6 +328,7 @@ async function loadAtlas() {
   const entries = saved?.entries || [];
   const loadedEntries = await Promise.all(entries.map((entry, index) => atlasEntryFromData(entry, index + 1, true)));
   state.atlas = loadedEntries.filter(Boolean);
+  normalizeAtlasNumericIDs();
   setStatus("图鉴已就绪", state.atlas.length ? `已加载 ${state.atlas.length} 个砖块模板。` : "图鉴为空，请先导入砖块。");
 }
 
@@ -344,6 +347,7 @@ async function atlasEntryFromData(entry, fallbackId, userAdded) {
     imageData,
     image,
     feature,
+    pixelFeature: pixelFeatureFromImage(image),
     userAdded
   };
 }
@@ -352,13 +356,14 @@ async function addAtlasImage(file) {
   const imageData = await readFileAsDataURL(file);
   const image = await loadImage(imageData);
   return {
-    id: state.atlas.length + 1,
+    id: nextAtlasNumericID(),
     uuid: crypto.randomUUID(),
     name: file.name.replace(/\.[^.]+$/, "") || nextAvailableAtlasName("砖块"),
     categoryID: state.selectedCategoryID,
     imageData,
     image,
     feature: featureFromImage(image),
+    pixelFeature: pixelFeatureFromImage(image),
     userAdded: true
   };
 }
@@ -380,6 +385,29 @@ function persistAtlas() {
     }));
   } catch {
     alert("浏览器本地空间不够，部分图鉴可能无法保存。");
+  }
+}
+
+function nextAtlasNumericID(extraEntries = []) {
+  const ids = [...state.atlas, ...extraEntries].map(entry => Number(entry.id) || 0);
+  return Math.max(0, ...ids) + 1;
+}
+
+function normalizeAtlasNumericIDs() {
+  const seen = new Set();
+  let next = 1;
+  for (const entry of state.atlas) {
+    const id = Number(entry.id);
+    if (id > 0 && !seen.has(id)) {
+      entry.id = id;
+      seen.add(id);
+      next = Math.max(next, id + 1);
+    } else {
+      while (seen.has(next)) next++;
+      entry.id = next;
+      seen.add(next);
+      next++;
+    }
   }
 }
 
@@ -572,6 +600,7 @@ function deleteActiveTile() {
   if (!entry || !confirm(`确定删除「${entry.name}」吗？`)) return;
   state.atlas = state.atlas.filter(item => item.uuid !== entry.uuid);
   state.selectedTileIDs.delete(entry.uuid);
+  normalizeAtlasNumericIDs();
   clampAtlasPage();
   persistAtlas();
   renderAtlas();
@@ -629,7 +658,7 @@ async function prepareScreenshotTileImports(file) {
     const name = nextAvailableAtlasName("图鉴", used);
     used.add(normalizeName(name));
     drafts.push({
-      id: state.atlas.length + drafts.length + 1,
+      id: nextAtlasNumericID(drafts),
       uuid: crypto.randomUUID(),
       draftID: crypto.randomUUID(),
       name,
@@ -637,6 +666,7 @@ async function prepareScreenshotTileImports(file) {
       imageData,
       image: tileImage,
       feature: featureFromImage(tileImage),
+      pixelFeature: pixelFeatureFromImage(tileImage),
       selected: false,
       duplicateMode: "rename",
       renameTo: nextAvailableAtlasName(name, used),
@@ -962,13 +992,14 @@ function saveImportDrafts() {
     const name = draft.name.trim() || nextAvailableAtlasName("图鉴");
     const existingIndex = state.atlas.findIndex(entry => normalizeName(entry.name) === normalizeName(name));
     const entry = {
-      id: state.atlas.length + 1,
+      id: nextAtlasNumericID(),
       uuid: draft.uuid || crypto.randomUUID(),
       name,
       categoryID: draft.categoryID || state.selectedCategoryID,
       imageData: draft.imageData,
       image: draft.image,
       feature: draft.feature,
+      pixelFeature: draft.pixelFeature || pixelFeatureFromImage(draft.image),
       userAdded: true
     };
     if (existingIndex >= 0 && draft.duplicateMode === "overwrite") {
@@ -985,9 +1016,12 @@ function saveImportDrafts() {
   state.importDrafts = [];
   state.importPreview = null;
   state.importCutPreview = null;
+  state.recognitionCategoryID = state.selectedCategoryID;
+  normalizeAtlasNumericIDs();
   clampAtlasPage();
   persistAtlas();
   renderAtlas();
+  renderRecognitionCategoryOptions();
   closeModal(els.importReviewModal);
   setAtlasMessage(`已导入 ${added} 个砖块${overwritten ? `，覆盖 ${overwritten} 个` : ""}`);
   if (state.image) recognizeCurrentImage();
@@ -1480,8 +1514,9 @@ function recognizeBoard() {
         nextConfidence.push(1);
         continue;
       }
-      const feature = featureFromCanvasRegion(ctx, rect, 0.03);
-      const match = matchAtlas(feature, atlasEntries);
+      const feature = featureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
+      const pixelFeature = pixelFeatureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
+      const match = matchAtlas({ feature, pixelFeature }, atlasEntries);
       if (match) {
         nextBoard.push(match.id);
         nextConfidence.push(Math.max(0, 1 - match.distance / DEFAULT_THRESHOLD));
@@ -1496,34 +1531,98 @@ function recognizeBoard() {
 }
 
 function isEmptyCell(ctx, rect) {
-  const image = ctx.getImageData(
-    Math.max(0, Math.floor(rect.x + rect.w * 0.18)),
-    Math.max(0, Math.floor(rect.y + rect.h * 0.18)),
-    Math.max(1, Math.floor(rect.w * 0.64)),
-    Math.max(1, Math.floor(rect.h * 0.64))
-  );
+  const sourceX = Math.max(0, Math.floor(rect.x + rect.w * 0.10));
+  const sourceY = Math.max(0, Math.floor(rect.y + rect.h * 0.10));
+  const sourceW = Math.max(1, Math.floor(rect.w * 0.80));
+  const sourceH = Math.max(1, Math.floor(rect.h * 0.80));
+  const sampleSize = 16;
+  const canvas = makeCanvas(sampleSize, sampleSize);
+  const sampleCtx = canvas.getContext("2d", { willReadFrequently: true });
+  sampleCtx.imageSmoothingEnabled = true;
+  sampleCtx.imageSmoothingQuality = "high";
+  sampleCtx.drawImage(ctx.canvas, sourceX, sourceY, sourceW, sourceH, 0, 0, sampleSize, sampleSize);
+  const image = sampleCtx.getImageData(0, 0, sampleSize, sampleSize);
+  const redValues = [];
+  const greenValues = [];
+  const blueValues = [];
+  const luminance = [];
   let brown = 0;
-  let interior = 0;
+  let lightTile = 0;
+  let saturatedNonBrown = 0;
   const total = image.data.length / 4;
   for (let i = 0; i < image.data.length; i += 4) {
     const r = image.data[i], g = image.data[i + 1], b = image.data[i + 2];
-    if (r > 105 && r < 185 && g > 55 && g < 125 && b < 65) brown++;
-    if (isTileInterior(r, g, b)) interior++;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const isBrownBoardPixel = r >= 95 && r <= 190 && g >= 45 && g <= 135 && b <= 80 && r > g + 18;
+    const isLightTileFacePixel = r >= 185 && g >= 195 && b >= 135;
+    if (isBrownBoardPixel) {
+      brown++;
+    } else if (max - min > 55) {
+      saturatedNonBrown++;
+    }
+    if (isLightTileFacePixel) lightTile++;
+    redValues.push(r);
+    greenValues.push(g);
+    blueValues.push(b);
+    luminance.push(r * 0.299 + g * 0.587 + b * 0.114);
   }
-  return brown / total > 0.38 && interior / total < 0.18;
+  const redMean = average(redValues);
+  const greenMean = average(greenValues);
+  const blueMean = average(blueValues);
+  const colorStd = (
+    standardDeviation(redValues, redMean) +
+    standardDeviation(greenValues, greenMean) +
+    standardDeviation(blueValues, blueMean)
+  ) / 3;
+  let edge = 0;
+  let edgeCount = 0;
+  for (let row = 0; row < sampleSize; row++) {
+    for (let col = 0; col < sampleSize; col++) {
+      const value = luminance[row * sampleSize + col];
+      if (col + 1 < sampleSize) {
+        edge += Math.abs(value - luminance[row * sampleSize + col + 1]);
+        edgeCount++;
+      }
+      if (row + 1 < sampleSize) {
+        edge += Math.abs(value - luminance[(row + 1) * sampleSize + col]);
+        edgeCount++;
+      }
+    }
+  }
+  const edgeMean = edge / Math.max(1, edgeCount);
+  const brownRatio = brown / total;
+  const lightTileRatio = lightTile / total;
+  const saturatedNonBrownRatio = saturatedNonBrown / total;
+  const solidBrownGap = redMean >= 125 && redMean <= 175 &&
+    greenMean >= 70 && greenMean <= 115 &&
+    blueMean >= 10 && blueMean <= 50 &&
+    colorStd < 8 &&
+    edgeMean < 2;
+  const mostlyBrownGapWithShadow = brownRatio > 0.55 &&
+    lightTileRatio < 0.18 &&
+    saturatedNonBrownRatio < 0.22 &&
+    edgeMean < 18;
+  return solidBrownGap || mostlyBrownGapWithShadow;
 }
 
-function matchAtlas(feature, entries = state.atlas) {
+function matchAtlas(sample, entries = state.atlas) {
+  const feature = Array.isArray(sample) ? sample : sample.feature;
+  const pixelFeature = Array.isArray(sample) ? null : sample.pixelFeature;
   let best = null;
   let second = null;
   for (const entry of entries) {
     if (!entry.feature || entry.feature.length !== feature.length) continue;
-    const distance = rms(feature, entry.feature);
+    const fingerprintDistance = rms(feature, entry.feature);
+    const pixelDistance = pixelFeature && entry.pixelFeature && entry.pixelFeature.length === pixelFeature.length
+      ? rms(pixelFeature, entry.pixelFeature)
+      : fingerprintDistance;
+    const distance = fingerprintDistance * 0.62 + pixelDistance * 0.38;
     if (!best || distance < best.distance) {
       second = best;
-      best = { id: entry.id, entry, distance };
+      best = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance };
     } else if (!second || distance < second.distance) {
-      second = { id: entry.id, entry, distance };
+      second = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance };
     }
   }
   if (!best) return null;
@@ -1544,6 +1643,51 @@ function featureFromImage(image) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
   return featureFromCanvasRegion(ctx, { x: 0, y: 0, w: canvas.width, h: canvas.height }, 0);
+}
+
+function pixelFeatureFromImage(image) {
+  const canvas = makeCanvas(image.naturalWidth || image.width || 96, image.naturalHeight || image.height || 96);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return pixelFeatureFromCanvasRegion(ctx, { x: 0, y: 0, w: canvas.width, h: canvas.height }, 0);
+}
+
+function pixelFeatureFromCanvasRegion(ctx, rect, insetRatio = 0) {
+  const size = 16;
+  const insetX = rect.w * insetRatio;
+  const insetY = rect.h * insetRatio;
+  const sourceX = Math.max(0, Math.floor(rect.x + insetX));
+  const sourceY = Math.max(0, Math.floor(rect.y + insetY));
+  const sourceW = Math.max(1, Math.floor(rect.w - insetX * 2));
+  const sourceH = Math.max(1, Math.floor(rect.h - insetY * 2));
+  const canvas = makeCanvas(size, size);
+  const sampleCtx = canvas.getContext("2d", { willReadFrequently: true });
+  sampleCtx.imageSmoothingEnabled = true;
+  sampleCtx.imageSmoothingQuality = "high";
+  sampleCtx.drawImage(ctx.canvas, sourceX, sourceY, sourceW, sourceH, 0, 0, size, size);
+  const image = sampleCtx.getImageData(0, 0, size, size);
+  const features = [];
+  const luminance = [];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      const edgeWeight = x === 0 || y === 0 || x === size - 1 || y === size - 1 ? 0.45 : 1;
+      const r = image.data[i] / 255;
+      const g = image.data[i + 1] / 255;
+      const b = image.data[i + 2] / 255;
+      luminance.push(r * 0.299 + g * 0.587 + b * 0.114);
+      features.push(r * edgeWeight, g * edgeWeight, b * edgeWeight);
+    }
+  }
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const center = luminance[y * size + x];
+      const right = x + 1 < size ? luminance[y * size + x + 1] : center;
+      const down = y + 1 < size ? luminance[(y + 1) * size + x] : center;
+      features.push((Math.abs(center - right) + Math.abs(center - down)) * 0.35);
+    }
+  }
+  return features;
 }
 
 function featureFromCanvasRegion(ctx, rect, insetRatio = 0) {
