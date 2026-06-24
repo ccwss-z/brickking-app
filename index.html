@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="砖王">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>砖王</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="./icons/icon-152.png">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header id="appChrome" class="app-chrome">
+      <button id="openAtlas" class="top-pill" type="button" aria-label="打开砖块图鉴">
+        <span class="sf-symbol">▦</span>
+        <span id="atlasCount">0</span>
+      </button>
+      <div class="brand">
+        <h1>砖王</h1>
+        <p>本地识别 · 步骤引导</p>
+      </div>
+      <span id="appVersion" class="version">v2.1.0</span>
+    </header>
+
+    <section id="homeScreen" class="screen active">
+      <section class="main-canvas">
+        <div id="workCanvas" class="work-canvas">
+          <nav class="canvas-tabs" aria-label="画布切换">
+            <button class="canvas-tab active" type="button" data-canvas="screenshot">原图</button>
+            <button class="canvas-tab" type="button" data-canvas="cutPreview" disabled>切割</button>
+            <button class="canvas-tab" type="button" data-canvas="correction" disabled>校正</button>
+          </nav>
+
+          <section id="canvas-screenshot" class="canvas-pane active">
+            <div class="image-stage">
+              <img id="sourceImage" alt="游戏截图">
+              <div id="emptyPreview" class="empty-state">
+                <div class="empty-mark">▦</div>
+                <strong>上传一张游戏截图</strong>
+                <span>识别前先选择图鉴分类，截图会在这里尽量大地显示。</span>
+              </div>
+            </div>
+          </section>
+
+          <section id="canvas-cutPreview" class="canvas-pane">
+            <div class="image-stage">
+              <canvas id="previewCanvas"></canvas>
+              <div id="emptyCutPreview" class="empty-state">
+                <div class="empty-mark">#</div>
+                <strong>暂无切割预览</strong>
+                <span>上传截图后会自动生成带框线的预览。</span>
+              </div>
+            </div>
+          </section>
+
+          <section id="canvas-correction" class="canvas-pane">
+            <div class="board-card">
+              <div class="board-title-row">
+                <div>
+                  <strong>识别校正</strong>
+                  <p>点错格可改为空格或同类图标组</p>
+                </div>
+                <span id="tileCountBadge" class="pill">0 块</span>
+              </div>
+              <div class="board-wrap" id="correctionBoard" aria-label="识别校正棋盘"></div>
+            </div>
+          </section>
+        </div>
+
+        <div id="resultCanvas" class="result-canvas" hidden>
+          <section class="instruction-card">
+            <div id="instructionIcon" class="instruction-icon">✦</div>
+            <div>
+              <strong id="stepTitle">还没有步骤</strong>
+              <p id="stepDescription">完成识别后点击开始分析。</p>
+            </div>
+          </section>
+
+          <div class="board-card">
+            <div class="board-title-row">
+              <div>
+                <strong id="resultTitle">最多可走步骤</strong>
+                <p id="resultSubtitle">已返回当前最多步骤。</p>
+              </div>
+              <span id="stepCounter" class="pill">0/0</span>
+            </div>
+            <div class="board-wrap step-board" id="stepBoard"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="bottom-panel">
+        <p id="warningMessage" class="warning" hidden></p>
+
+        <div id="normalControls" class="control-stack">
+          <div class="control-row">
+            <label class="select-shell">
+              <span>图鉴</span>
+              <select id="atlasCategorySelect"></select>
+            </label>
+            <button id="savePreviewButton" class="soft-button" type="button" disabled>保存预览</button>
+          </div>
+
+          <button id="uploadComputerButton" class="computer-button" type="button" hidden>上传电脑端</button>
+
+          <label class="primary-solid file-button">
+            <input id="imageInput" type="file" accept="image/*">
+            <span id="uploadButtonText">上传截图</span>
+          </label>
+
+          <button id="solveButton" class="primary-solid" type="button" disabled>开始分析</button>
+          <p id="statusText" class="panel-note">先上传截图，砖王会自动切出 14 x 10 棋盘。</p>
+        </div>
+
+        <div id="stepControls" class="control-stack" hidden>
+          <div class="step-actions">
+            <button id="prevStep" class="soft-button" type="button">上一步</button>
+            <button id="nextStep" class="primary-solid" type="button">下一步</button>
+          </div>
+
+          <div class="auto-next-box">
+            <label class="switch-row">
+              <span>自动下一步</span>
+              <input id="autoNextToggle" type="checkbox">
+            </label>
+            <label class="interval-row">
+              <span>间隔</span>
+              <input id="autoNextSeconds" type="number" min="0.5" max="30" step="0.5" value="2">
+              <span>秒</span>
+            </label>
+            <button id="autoNextPauseButton" class="soft-button tiny" type="button">暂停</button>
+          </div>
+
+          <button id="backToCorrection" class="plain-button" type="button">返回校正/重新分析</button>
+          <p id="resultReason" class="warning"></p>
+        </div>
+      </section>
+    </section>
+
+    <section id="atlasScreen" class="screen">
+      <header class="atlas-header">
+        <button id="backHome" class="soft-button back-button" type="button">返回</button>
+        <div>
+          <h2>砖块图鉴</h2>
+          <p id="atlasSubtitle">默认 · 0 个砖块</p>
+        </div>
+        <span id="atlasCountInline" class="pill">0 个</span>
+      </header>
+
+      <nav id="categoryStrip" class="category-strip" aria-label="图鉴分类"></nav>
+
+      <section class="atlas-gallery-card">
+        <div id="atlasEmptyState" class="empty-state atlas-empty">
+          <div class="empty-mark">▤</div>
+          <strong>暂无砖块</strong>
+          <span>先导入砖块图片或使用截图分割。</span>
+        </div>
+        <div class="atlas-grid" id="atlasGrid"></div>
+      </section>
+
+      <div class="atlas-pager">
+        <button id="atlasPrevPage" class="soft-button square" type="button">‹</button>
+        <strong id="atlasPageIndicator">1 / 1</strong>
+        <button id="atlasNextPage" class="soft-button square" type="button">›</button>
+      </div>
+
+      <section class="atlas-actions">
+        <div class="control-row">
+          <button id="multiSelectButton" class="atlas-action purple" type="button">多选删除</button>
+          <button id="deleteSelectedButton" class="atlas-action danger" type="button" hidden>删除 0 个</button>
+        </div>
+
+        <div class="control-row">
+          <button id="addCategoryButton" class="atlas-action blue" type="button">添加分类</button>
+          <button id="deleteCategoryButton" class="atlas-action danger" type="button">删除分类</button>
+        </div>
+
+        <div class="control-row">
+          <label class="atlas-action black">
+            <input id="atlasInput" type="file" accept="image/*" multiple>
+            导入砖块图
+          </label>
+          <label class="atlas-action orange">
+            <input id="atlasScreenshotInput" type="file" accept="image/*">
+            截图分割
+          </label>
+        </div>
+
+        <div class="atlas-footer-row">
+          <p id="atlasMessage" class="panel-note">点砖块可改名、转移分类或删除。导入会加入当前分类。</p>
+          <button id="clearData" class="trash-button" type="button">🗑</button>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div id="categoryModal" class="modal-backdrop" hidden>
+    <section class="modal-card small-modal">
+      <h3>添加分类</h3>
+      <p>新建一个图鉴分类，后续导入的砖块可以放到这个分类里。</p>
+      <input id="categoryNameInput" class="text-input" type="text" placeholder="分类名称">
+      <div class="modal-actions">
+        <button id="cancelCategoryButton" class="soft-button" type="button">取消</button>
+        <button id="confirmCategoryButton" class="primary-solid" type="button">添加</button>
+      </div>
+    </section>
+  </div>
+
+  <div id="importReviewModal" class="modal-backdrop" hidden>
+    <section class="modal-card">
+      <header class="modal-header">
+        <button id="cancelImportButton" class="soft-button" type="button">取消</button>
+        <h3>导入砖块</h3>
+        <button id="saveImportButton" class="primary-solid compact" type="button">保存</button>
+      </header>
+
+      <div id="importPreviewSection" class="review-section" hidden>
+        <h4>截图分割预览</h4>
+        <canvas id="importPreviewCanvas"></canvas>
+        <button id="saveImportPreviewButton" class="soft-button" type="button">保存原图线框预览</button>
+      </div>
+
+      <div id="importCutSection" class="review-section" hidden>
+        <h4>完整切割图</h4>
+        <canvas id="importCutCanvas"></canvas>
+      </div>
+
+      <div class="review-section">
+        <button id="selectAllDraftsButton" class="soft-button" type="button">全选</button>
+      </div>
+
+      <div id="draftList" class="draft-list"></div>
+    </section>
+  </div>
+
+  <div id="tileMenuModal" class="modal-backdrop" hidden>
+    <section class="modal-card small-modal">
+      <h3 id="tileMenuTitle">砖块</h3>
+      <button id="renameTileButton" class="soft-button" type="button">改名</button>
+      <label class="select-shell full-select">
+        <span>转移分类</span>
+        <select id="moveTileCategorySelect"></select>
+      </label>
+      <button id="deleteTileButton" class="danger-button" type="button">删除</button>
+      <button id="closeTileMenuButton" class="plain-button" type="button">关闭</button>
+    </section>
+  </div>
+
+  <template id="cellTemplate">
+    <button class="cell" type="button"></button>
+  </template>
+
+  <script src="./app.js" type="module"></script>
+</body>
+</html>
