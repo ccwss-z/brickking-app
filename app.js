@@ -758,7 +758,7 @@ function detectAtlasTemplateByComponents(data, width, height) {
     cells: rects
   };
   const gridRatio = grid.w / Math.max(1, grid.h);
-  if (gridRatio < 1.05 || gridRatio > 1.75) return null;
+  if (gridRatio < 0.9 || gridRatio > 1.75) return null;
   return grid;
 }
 
