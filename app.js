@@ -704,12 +704,13 @@ function cropAtlasTemplateTileContent(rect) {
   const cardSide = Math.min(rect.w, rect.h);
   const insetX = cardSide * 0.075;
   const insetTop = cardSide * 0.055;
+  const insetBottom = cardSide * 0.19;
   const contentSide = Math.max(1, cardSide - insetX * 2);
   return {
     x: rect.x + (rect.w - cardSide) / 2 + insetX,
     y: rect.y + insetTop,
     w: contentSide,
-    h: contentSide
+    h: Math.max(1, cardSide - insetTop - insetBottom)
   };
 }
 
