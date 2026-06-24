@@ -3,6 +3,7 @@ const COLS = 10;
 const CELL_COUNT = ROWS * COLS;
 const DEFAULT_THRESHOLD = 0.34;
 const ANALYSIS_FEATURE_INSET = 0.07;
+const MODEL_DISTANCE_THRESHOLD = 0.18;
 const DEFAULT_CATEGORY_ID = "00000000-0000-0000-0000-000000000001";
 const ATLAS_STORAGE_KEY = "brickking-pwa-atlas-v2";
 const ATLAS_PAGE_SIZE = 20;
@@ -29,7 +30,10 @@ const state = {
   stepBoards: [],
   autoTimer: null,
   autoPaused: false,
-  canvasMode: "screenshot"
+  canvasMode: "screenshot",
+  embeddingModel: null,
+  embeddingModelPromise: null,
+  embeddingModelFailed: false
 };
 
 const $ = selector => document.querySelector(selector);
@@ -1050,6 +1054,54 @@ function closeModal(modal) {
   }
 }
 
+async function ensureEmbeddingModel() {
+  if (state.embeddingModel || state.embeddingModelFailed) return state.embeddingModel;
+  if (!state.embeddingModelPromise) {
+    state.embeddingModelPromise = loadEmbeddingModel().catch(error => {
+      console.warn("Embedding model unavailable, falling back to fingerprint matching.", error);
+      state.embeddingModelFailed = true;
+      return null;
+    });
+  }
+  state.embeddingModel = await Promise.race([
+    state.embeddingModelPromise,
+    new Promise(resolve => setTimeout(() => resolve(null), 3000))
+  ]);
+  return state.embeddingModel;
+}
+
+async function loadEmbeddingModel() {
+  setStatus("加载识别模型", "首次使用会下载小型视觉模型。");
+  await loadScriptOnce("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js");
+  await loadScriptOnce("https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.1/dist/mobilenet.min.js");
+  if (!window.mobilenet) throw new Error("MobileNet failed to load");
+  return window.mobilenet.load({ version: 2, alpha: 0.25 });
+}
+
+function loadScriptOnce(src) {
+  const existing = document.querySelector(`script[src="${src}"]`);
+  if (existing) {
+    return existing.dataset.loaded === "true"
+      ? Promise.resolve()
+      : new Promise((resolve, reject) => {
+          existing.addEventListener("load", resolve, { once: true });
+          existing.addEventListener("error", reject, { once: true });
+        });
+  }
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.crossOrigin = "anonymous";
+    script.addEventListener("load", () => {
+      script.dataset.loaded = "true";
+      resolve();
+    }, { once: true });
+    script.addEventListener("error", reject, { once: true });
+    document.head.appendChild(script);
+  });
+}
+
 function downloadCanvas(canvas, filename) {
   const anchor = document.createElement("a");
   anchor.download = filename;
@@ -1080,9 +1132,10 @@ async function loadScreenshot(file) {
 async function recognizeCurrentImage() {
   if (!state.image) return;
   const started = performance.now();
+  await ensureEmbeddingModel();
   state.grid = detectGrid(state.image);
   drawPreview();
-  recognizeBoard();
+  await recognizeBoard();
   renderBoard(els.correctionBoard, state.board, { editable: true });
   setCanvasEnabled("cutPreview", true);
   setCanvasEnabled("correction", true);
@@ -1489,7 +1542,7 @@ function drawPreview() {
   canvas.classList.add("visible");
 }
 
-function recognizeBoard() {
+async function recognizeBoard() {
   const image = state.image;
   const grid = state.grid;
   if (!image || !grid) return;
@@ -1499,6 +1552,9 @@ function recognizeBoard() {
   ctx.drawImage(image, 0, 0);
   const cellW = grid.w / COLS;
   const cellH = grid.h / ROWS;
+  if (state.embeddingModel) {
+    await ensureAtlasEmbeddings(atlasEntries);
+  }
   const nextBoard = [];
   const nextConfidence = [];
   for (let r = 0; r < ROWS; r++) {
@@ -1516,7 +1572,8 @@ function recognizeBoard() {
       }
       const feature = featureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
       const pixelFeature = pixelFeatureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
-      const match = matchAtlas({ feature, pixelFeature }, atlasEntries);
+      const embedding = state.embeddingModel ? await embeddingFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET) : null;
+      const match = matchAtlas({ feature, pixelFeature, embedding }, atlasEntries);
       if (match) {
         nextBoard.push(match.id);
         nextConfidence.push(Math.max(0, 1 - match.distance / DEFAULT_THRESHOLD));
@@ -1609,6 +1666,7 @@ function isEmptyCell(ctx, rect) {
 function matchAtlas(sample, entries = state.atlas) {
   const feature = Array.isArray(sample) ? sample : sample.feature;
   const pixelFeature = Array.isArray(sample) ? null : sample.pixelFeature;
+  const embedding = Array.isArray(sample) ? null : sample.embedding;
   let best = null;
   let second = null;
   for (const entry of entries) {
@@ -1617,15 +1675,21 @@ function matchAtlas(sample, entries = state.atlas) {
     const pixelDistance = pixelFeature && entry.pixelFeature && entry.pixelFeature.length === pixelFeature.length
       ? rms(pixelFeature, entry.pixelFeature)
       : fingerprintDistance;
-    const distance = fingerprintDistance * 0.62 + pixelDistance * 0.38;
+    const fallbackDistance = fingerprintDistance * 0.62 + pixelDistance * 0.38;
+    const embeddingDistance = embedding && entry.embedding ? cosineDistance(embedding, entry.embedding) : null;
+    const distance = embeddingDistance == null ? fallbackDistance : embeddingDistance * 0.82 + Math.min(1, fallbackDistance) * 0.18;
     if (!best || distance < best.distance) {
       second = best;
-      best = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance };
+      best = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance, embeddingDistance };
     } else if (!second || distance < second.distance) {
-      second = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance };
+      second = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance, embeddingDistance };
     }
   }
   if (!best) return null;
+  if (best.embeddingDistance != null) {
+    if (best.embeddingDistance > MODEL_DISTANCE_THRESHOLD && best.distance > DEFAULT_THRESHOLD) return null;
+    return best;
+  }
   if (best.distance > DEFAULT_THRESHOLD) return null;
   if (second) {
     const gap = second.distance - best.distance;
@@ -1688,6 +1752,52 @@ function pixelFeatureFromCanvasRegion(ctx, rect, insetRatio = 0) {
     }
   }
   return features;
+}
+
+async function ensureAtlasEmbeddings(entries) {
+  if (!state.embeddingModel) return;
+  for (const entry of entries) {
+    if (!entry.embedding && entry.image) {
+      entry.embedding = await embeddingFromImage(entry.image);
+    }
+  }
+}
+
+async function embeddingFromImage(image) {
+  const canvas = makeCanvas(128, 128);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return embeddingFromCanvas(canvas);
+}
+
+async function embeddingFromCanvasRegion(ctx, rect, insetRatio = 0) {
+  const insetX = rect.w * insetRatio;
+  const insetY = rect.h * insetRatio;
+  const sourceX = Math.max(0, Math.floor(rect.x + insetX));
+  const sourceY = Math.max(0, Math.floor(rect.y + insetY));
+  const sourceW = Math.max(1, Math.floor(rect.w - insetX * 2));
+  const sourceH = Math.max(1, Math.floor(rect.h - insetY * 2));
+  const canvas = makeCanvas(128, 128);
+  const sampleCtx = canvas.getContext("2d", { willReadFrequently: true });
+  sampleCtx.imageSmoothingEnabled = true;
+  sampleCtx.imageSmoothingQuality = "high";
+  sampleCtx.drawImage(ctx.canvas, sourceX, sourceY, sourceW, sourceH, 0, 0, canvas.width, canvas.height);
+  return embeddingFromCanvas(canvas);
+}
+
+async function embeddingFromCanvas(canvas) {
+  if (!state.embeddingModel) return null;
+  const tensor = state.embeddingModel.infer(canvas, true);
+  const values = Array.from(await tensor.data());
+  tensor.dispose?.();
+  return normalizeVector(values);
+}
+
+function normalizeVector(values) {
+  const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0)) || 1;
+  return values.map(value => value / norm);
 }
 
 function featureFromCanvasRegion(ctx, rect, insetRatio = 0) {
@@ -2198,6 +2308,13 @@ function rms(a, b) {
     sum += d * d;
   }
   return Math.sqrt(sum / Math.max(1, n));
+}
+
+function cosineDistance(a, b) {
+  const n = Math.min(a.length, b.length);
+  let dot = 0;
+  for (let i = 0; i < n; i++) dot += a[i] * b[i];
+  return Math.max(0, 1 - dot);
 }
 
 function readFileAsDataURL(file) {
