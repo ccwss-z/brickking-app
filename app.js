@@ -658,7 +658,7 @@ async function prepareScreenshotTileImports(file) {
   const used = new Set(state.atlas.map(entry => normalizeName(entry.name)));
   const drafts = [];
   for (const rect of cells) {
-    const cropRect = insetAtlasCropRect(rect);
+    const cropRect = templateGrid ? cropAtlasTemplateTileContent(rect) : insetAtlasCropRect(rect);
     const imageData = cropImageToDataURL(image, cropRect, 120, 120);
     const tileImage = await loadImage(imageData);
     const name = nextAvailableAtlasName("图鉴", used);
@@ -697,6 +697,19 @@ function insetAtlasCropRect(rect) {
     y: rect.y + insetTop,
     w: Math.max(1, rect.w - insetX * 2),
     h: Math.max(1, rect.h - insetTop - insetBottom)
+  };
+}
+
+function cropAtlasTemplateTileContent(rect) {
+  const cardSide = Math.min(rect.w, rect.h);
+  const insetX = cardSide * 0.075;
+  const insetTop = cardSide * 0.055;
+  const contentSide = Math.max(1, cardSide - insetX * 2);
+  return {
+    x: rect.x + (rect.w - cardSide) / 2 + insetX,
+    y: rect.y + insetTop,
+    w: contentSide,
+    h: contentSide
   };
 }
 
