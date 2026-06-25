@@ -4,6 +4,8 @@ const CELL_COUNT = ROWS * COLS;
 const DEFAULT_THRESHOLD = 0.42;
 const ANALYSIS_FEATURE_INSET = 0.07;
 const MODEL_DISTANCE_THRESHOLD = 0.18;
+const MAX_SAME_TILE_COUNT = 4;
+const MATCH_CANDIDATE_LIMIT = 8;
 const DEFAULT_CATEGORY_ID = "00000000-0000-0000-0000-000000000001";
 const ATLAS_STORAGE_KEY = "brickking-pwa-atlas-v2";
 const ATLAS_PAGE_SIZE = 20;
@@ -1746,10 +1748,10 @@ async function recognizeBoard() {
   if (state.embeddingModel) {
     await ensureAtlasEmbeddings(atlasEntries);
   }
-  const nextBoard = [];
-  const nextConfidence = [];
+  const cellResults = [];
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
+      const index = r * COLS + c;
       const rect = {
         x: grid.x + c * cellW,
         y: grid.y + r * cellH,
@@ -1757,26 +1759,30 @@ async function recognizeBoard() {
         h: cellH
       };
       if (isEmptyCell(ctx, rect)) {
-        nextBoard.push(0);
-        nextConfidence.push(1);
+        cellResults.push({ index, value: 0, confidence: 1, candidates: [] });
         continue;
       }
       const feature = featureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
       const pixelFeature = pixelFeatureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
       const iconFeature = iconFeatureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
       const embedding = state.embeddingModel ? await embeddingFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET) : null;
-      const match = matchAtlas({ feature, pixelFeature, iconFeature, embedding }, atlasEntries);
+      const candidates = rankAtlasMatches({ feature, pixelFeature, iconFeature, embedding }, atlasEntries);
+      const match = firstAcceptedAtlasMatch(candidates);
       if (match) {
-        nextBoard.push(match.id);
-        nextConfidence.push(Math.max(0, 1 - match.distance / DEFAULT_THRESHOLD));
+        cellResults.push({
+          index,
+          value: match.id,
+          confidence: Math.max(0, 1 - match.distance / DEFAULT_THRESHOLD),
+          candidates
+        });
       } else {
-        nextBoard.push(1_000_000 + r * COLS + c);
-        nextConfidence.push(0);
+        cellResults.push({ index, value: 1_000_000 + index, confidence: 0, candidates });
       }
     }
   }
-  state.board = nextBoard;
-  state.confidence = nextConfidence;
+  applyTileCountLimit(cellResults);
+  state.board = cellResults.map(result => result.value);
+  state.confidence = cellResults.map(result => result.confidence);
 }
 
 function isEmptyCell(ctx, rect) {
@@ -1856,12 +1862,15 @@ function isEmptyCell(ctx, rect) {
 }
 
 function matchAtlas(sample, entries = state.atlas) {
+  return firstAcceptedAtlasMatch(rankAtlasMatches(sample, entries));
+}
+
+function rankAtlasMatches(sample, entries = state.atlas) {
   const feature = Array.isArray(sample) ? sample : sample.feature;
   const pixelFeature = Array.isArray(sample) ? null : sample.pixelFeature;
   const iconFeature = Array.isArray(sample) ? null : sample.iconFeature;
   const embedding = Array.isArray(sample) ? null : sample.embedding;
-  let best = null;
-  let second = null;
+  const matches = [];
   for (const entry of entries) {
     if (!entry.feature || entry.feature.length !== feature.length) continue;
     const fingerprintDistance = rms(feature, entry.feature);
@@ -1876,13 +1885,14 @@ function matchAtlas(sample, entries = state.atlas) {
       : iconDistance * 0.62 + pixelDistance * 0.23 + fingerprintDistance * 0.15;
     const embeddingDistance = embedding && entry.embedding ? cosineDistance(embedding, entry.embedding) : null;
     const distance = embeddingDistance == null ? fallbackDistance : Math.min(1, fallbackDistance) * 0.90 + embeddingDistance * 0.10;
-    if (!best || distance < best.distance) {
-      second = best;
-      best = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance, iconDistance, embeddingDistance };
-    } else if (!second || distance < second.distance) {
-      second = { id: entry.id, entry, distance, fingerprintDistance, pixelDistance, iconDistance, embeddingDistance };
-    }
+    matches.push({ id: entry.id, entry, distance, fingerprintDistance, pixelDistance, iconDistance, embeddingDistance });
   }
+  return matches.sort((a, b) => a.distance - b.distance).slice(0, MATCH_CANDIDATE_LIMIT);
+}
+
+function firstAcceptedAtlasMatch(matches) {
+  const best = matches[0];
+  const second = matches[1];
   if (!best) return null;
   if (best.embeddingDistance != null) {
     if (best.embeddingDistance > MODEL_DISTANCE_THRESHOLD && best.distance > DEFAULT_THRESHOLD) return null;
@@ -1899,6 +1909,53 @@ function matchAtlas(sample, entries = state.atlas) {
     return null;
   }
   return best;
+}
+
+function applyTileCountLimit(cellResults) {
+  const counts = tileCounts(cellResults);
+  let changed = true;
+  for (let pass = 0; pass < 4 && changed; pass++) {
+    changed = false;
+    for (const [tileID, count] of counts.entries()) {
+      if (count <= MAX_SAME_TILE_COUNT) continue;
+      const overflow = count - MAX_SAME_TILE_COUNT;
+      const assigned = cellResults
+        .filter(result => result.value === tileID)
+        .sort((a, b) => {
+          const ad = a.candidates?.find(candidate => candidate.id === tileID)?.distance ?? 1;
+          const bd = b.candidates?.find(candidate => candidate.id === tileID)?.distance ?? 1;
+          return bd - ad;
+        });
+      for (const result of assigned.slice(0, overflow)) {
+        const replacement = result.candidates.find(candidate => {
+          if (candidate.id === tileID) return false;
+          if ((counts.get(candidate.id) || 0) >= MAX_SAME_TILE_COUNT) return false;
+          if (candidate.distance > DEFAULT_THRESHOLD) return false;
+          const current = result.candidates.find(item => item.id === tileID);
+          return !current || candidate.distance <= current.distance + 0.16;
+        });
+        counts.set(tileID, (counts.get(tileID) || 1) - 1);
+        if (replacement) {
+          result.value = replacement.id;
+          result.confidence = Math.max(0, 1 - replacement.distance / DEFAULT_THRESHOLD);
+          counts.set(replacement.id, (counts.get(replacement.id) || 0) + 1);
+        } else {
+          result.value = 1_000_000 + result.index;
+          result.confidence = 0;
+        }
+        changed = true;
+      }
+    }
+  }
+}
+
+function tileCounts(cellResults) {
+  const counts = new Map();
+  for (const result of cellResults) {
+    if (result.value <= 0 || result.value >= 1_000_000) continue;
+    counts.set(result.value, (counts.get(result.value) || 0) + 1);
+  }
+  return counts;
 }
 
 function featureFromImage(image) {
