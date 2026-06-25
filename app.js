@@ -39,7 +39,8 @@ const state = {
   canvasMode: "screenshot",
   embeddingModel: null,
   embeddingModelPromise: null,
-  embeddingModelFailed: false
+  embeddingModelFailed: false,
+  debugCellResults: []
 };
 
 const $ = selector => document.querySelector(selector);
@@ -1823,6 +1824,21 @@ async function recognizeBoard() {
   applyTileCountLimit(cellResults);
   state.board = cellResults.map(result => result.value);
   state.confidence = cellResults.map(result => result.confidence);
+  state.debugCellResults = cellResults.map(result => ({
+    index: result.index,
+    value: result.value,
+    confidence: result.confidence,
+    candidates: result.candidates?.slice(0, MATCH_CANDIDATE_LIMIT).map(candidate => ({
+      id: candidate.id,
+      distance: candidate.distance,
+      fingerprintDistance: candidate.fingerprintDistance,
+      pixelDistance: candidate.pixelDistance,
+      iconDistance: candidate.iconDistance,
+      colorDistance: candidate.colorDistance,
+      embeddingDistance: candidate.embeddingDistance,
+      name: candidate.entry?.name
+    })) || []
+  }));
 }
 
 function isEmptyCell(ctx, rect) {
@@ -2669,6 +2685,7 @@ function describeMove(move) {
 
 window.__brickkingDebug = () => ({
   board: state.board.slice(),
+  cellResults: state.debugCellResults,
   steps: state.steps.slice(),
   stepBoards: state.stepBoards.map(board => board.slice()),
   atlas: state.atlas.map(entry => ({ id: entry.id, name: entry.name, category: entry.category }))
