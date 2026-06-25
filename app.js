@@ -9,6 +9,7 @@ const VALID_TILE_COUNTS = new Set([2, 4]);
 const MATCH_CANDIDATE_LIMIT = 8;
 const WEAK_MATCH_DISTANCE = 0.34;
 const WEAK_QUARTET_DISTANCE_GAP = 0.045;
+const COLOR_MISMATCH_DISTANCE = 0.50;
 const DEFAULT_CATEGORY_ID = "00000000-0000-0000-0000-000000000001";
 const ATLAS_STORAGE_KEY = "brickking-pwa-atlas-v2";
 const ATLAS_PAGE_SIZE = 20;
@@ -358,6 +359,7 @@ async function atlasEntryFromData(entry, fallbackId, userAdded) {
     feature,
     pixelFeature: pixelFeatureFromImage(image),
     iconFeature: iconFeatureFromImage(image),
+    colorFeature: colorFeatureFromImage(image),
     userAdded
   };
 }
@@ -375,6 +377,7 @@ async function addAtlasImage(file) {
     feature: featureFromImage(image),
     pixelFeature: pixelFeatureFromImage(image),
     iconFeature: iconFeatureFromImage(image),
+    colorFeature: colorFeatureFromImage(image),
     userAdded: true
   };
 }
@@ -679,6 +682,7 @@ async function prepareScreenshotTileImports(file) {
       feature: featureFromImage(tileImage),
       pixelFeature: pixelFeatureFromImage(tileImage),
       iconFeature: iconFeatureFromImage(tileImage),
+      colorFeature: colorFeatureFromImage(tileImage),
       selected: false,
       duplicateMode: "rename",
       renameTo: nextAvailableAtlasName(name, used),
@@ -1034,6 +1038,7 @@ function saveImportDrafts() {
       feature: draft.feature,
       pixelFeature: draft.pixelFeature || pixelFeatureFromImage(draft.image),
       iconFeature: draft.iconFeature || iconFeatureFromImage(draft.image),
+      colorFeature: draft.colorFeature || colorFeatureFromImage(draft.image),
       userAdded: true
     };
     if (existingIndex >= 0 && draft.duplicateMode === "overwrite") {
@@ -1768,8 +1773,9 @@ async function recognizeBoard() {
       const feature = featureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
       const pixelFeature = pixelFeatureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
       const iconFeature = iconFeatureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
+      const colorFeature = colorFeatureFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET);
       const embedding = state.embeddingModel ? await embeddingFromCanvasRegion(ctx, rect, ANALYSIS_FEATURE_INSET) : null;
-      const candidates = rankAtlasMatches({ feature, pixelFeature, iconFeature, embedding }, atlasEntries);
+      const candidates = rankAtlasMatches({ feature, pixelFeature, iconFeature, colorFeature, embedding }, atlasEntries);
       const match = firstAcceptedAtlasMatch(candidates);
       if (match) {
         cellResults.push({
@@ -1779,7 +1785,8 @@ async function recognizeBoard() {
           candidates,
           sampleFeature: feature,
           samplePixelFeature: pixelFeature,
-          sampleIconFeature: iconFeature
+          sampleIconFeature: iconFeature,
+          sampleColorFeature: colorFeature
         });
       } else {
         cellResults.push({
@@ -1789,7 +1796,8 @@ async function recognizeBoard() {
           candidates,
           sampleFeature: feature,
           samplePixelFeature: pixelFeature,
-          sampleIconFeature: iconFeature
+          sampleIconFeature: iconFeature,
+          sampleColorFeature: colorFeature
         });
       }
     }
@@ -1883,6 +1891,7 @@ function rankAtlasMatches(sample, entries = state.atlas) {
   const feature = Array.isArray(sample) ? sample : sample.feature;
   const pixelFeature = Array.isArray(sample) ? null : sample.pixelFeature;
   const iconFeature = Array.isArray(sample) ? null : sample.iconFeature;
+  const colorFeature = Array.isArray(sample) ? null : sample.colorFeature;
   const embedding = Array.isArray(sample) ? null : sample.embedding;
   const matches = [];
   for (const entry of entries) {
@@ -1894,12 +1903,15 @@ function rankAtlasMatches(sample, entries = state.atlas) {
     const iconDistance = iconFeature && entry.iconFeature && entry.iconFeature.length === iconFeature.length
       ? rms(iconFeature, entry.iconFeature)
       : null;
+    const colorDistance = colorFeature && entry.colorFeature && entry.colorFeature.length === colorFeature.length
+      ? rms(colorFeature, entry.colorFeature)
+      : null;
     const fallbackDistance = iconDistance == null
-      ? fingerprintDistance * 0.58 + pixelDistance * 0.42
-      : iconDistance * 0.62 + pixelDistance * 0.23 + fingerprintDistance * 0.15;
+      ? fingerprintDistance * 0.40 + pixelDistance * 0.24 + (colorDistance ?? fingerprintDistance) * 0.36
+      : iconDistance * 0.46 + (colorDistance ?? iconDistance) * 0.32 + pixelDistance * 0.14 + fingerprintDistance * 0.08;
     const embeddingDistance = embedding && entry.embedding ? cosineDistance(embedding, entry.embedding) : null;
     const distance = embeddingDistance == null ? fallbackDistance : Math.min(1, fallbackDistance) * 0.90 + embeddingDistance * 0.10;
-    matches.push({ id: entry.id, entry, distance, fingerprintDistance, pixelDistance, iconDistance, embeddingDistance });
+    matches.push({ id: entry.id, entry, distance, fingerprintDistance, pixelDistance, iconDistance, colorDistance, embeddingDistance });
   }
   return matches.sort((a, b) => a.distance - b.distance).slice(0, MATCH_CANDIDATE_LIMIT);
 }
@@ -1917,7 +1929,8 @@ function firstAcceptedAtlasMatch(matches) {
     const gap = second.distance - best.distance;
     const ratio = best.distance / Math.max(second.distance, 0.0001);
     const strongAbsoluteMatch = best.distance <= 0.29 ||
-      (best.iconDistance != null && best.iconDistance <= 0.31 && best.pixelDistance <= 0.38);
+      (best.iconDistance != null && best.iconDistance <= 0.31 && best.pixelDistance <= 0.38 && (best.colorDistance == null || best.colorDistance <= COLOR_MISMATCH_DISTANCE));
+    if (best.colorDistance != null && best.colorDistance > COLOR_MISMATCH_DISTANCE && best.distance > 0.30) return null;
     if (!strongAbsoluteMatch && best.distance > 0.34 && (gap < 0.012 || ratio > 0.975)) return null;
   } else if (best.distance > Math.min(0.22, DEFAULT_THRESHOLD)) {
     return null;
@@ -2025,7 +2038,11 @@ function averageCrossDistance(left, right) {
 }
 
 function sampleDistance(a, b) {
+  if (a.sampleColorFeature && b.sampleColorFeature && a.sampleIconFeature && b.sampleIconFeature) {
+    return rms(a.sampleIconFeature, b.sampleIconFeature) * 0.55 + rms(a.sampleColorFeature, b.sampleColorFeature) * 0.45;
+  }
   if (a.sampleIconFeature && b.sampleIconFeature) return rms(a.sampleIconFeature, b.sampleIconFeature);
+  if (a.sampleColorFeature && b.sampleColorFeature) return rms(a.sampleColorFeature, b.sampleColorFeature);
   if (a.samplePixelFeature && b.samplePixelFeature) return rms(a.samplePixelFeature, b.samplePixelFeature);
   if (a.sampleFeature && b.sampleFeature) return rms(a.sampleFeature, b.sampleFeature);
   return 0;
@@ -2059,6 +2076,13 @@ function iconFeatureFromImage(image) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
   return iconFeatureFromCanvasRegion(ctx, { x: 0, y: 0, w: canvas.width, h: canvas.height }, 0);
+}
+
+function colorFeatureFromImage(image) {
+  const canvas = makeCanvas(image.naturalWidth || image.width || 96, image.naturalHeight || image.height || 96);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return colorFeatureFromCanvasRegion(ctx, { x: 0, y: 0, w: canvas.width, h: canvas.height }, 0);
 }
 
 function pixelFeatureFromCanvasRegion(ctx, rect, insetRatio = 0) {
@@ -2179,6 +2203,83 @@ function iconFeatureFromCanvasRegion(ctx, rect, insetRatio = 0) {
     }
   }
   return features;
+}
+
+function colorFeatureFromCanvasRegion(ctx, rect, insetRatio = 0) {
+  const size = 48;
+  const hueBins = 18;
+  const insetX = rect.w * insetRatio;
+  const insetY = rect.h * insetRatio;
+  const sourceX = Math.max(0, Math.floor(rect.x + insetX));
+  const sourceY = Math.max(0, Math.floor(rect.y + insetY));
+  const sourceW = Math.max(1, Math.floor(rect.w - insetX * 2));
+  const sourceH = Math.max(1, Math.floor(rect.h - insetY * 2));
+  const canvas = makeCanvas(size, size);
+  const sampleCtx = canvas.getContext("2d", { willReadFrequently: true });
+  sampleCtx.imageSmoothingEnabled = true;
+  sampleCtx.imageSmoothingQuality = "high";
+  sampleCtx.drawImage(ctx.canvas, sourceX, sourceY, sourceW, sourceH, 0, 0, size, size);
+  const image = sampleCtx.getImageData(0, 0, size, size);
+  const hueHistogram = Array(hueBins).fill(0);
+  const saturationBands = Array(4).fill(0);
+  const valueBands = Array(4).fill(0);
+  let count = 0;
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  let saturationSum = 0;
+  let valueSum = 0;
+
+  for (let i = 0; i < image.data.length; i += 4) {
+    const r = image.data[i];
+    const g = image.data[i + 1];
+    const b = image.data[i + 2];
+    if (!isIconForegroundPixel(r, g, b)) continue;
+    const [h, s, v] = rgbToHsv(r, g, b);
+    const weight = 0.35 + s * 0.65;
+    hueHistogram[Math.min(hueBins - 1, Math.floor(h * hueBins))] += weight;
+    saturationBands[Math.min(3, Math.floor(s * 4))] += weight;
+    valueBands[Math.min(3, Math.floor(v * 4))] += weight;
+    red += r / 255;
+    green += g / 255;
+    blue += b / 255;
+    saturationSum += s;
+    valueSum += v;
+    count++;
+  }
+
+  const total = Math.max(1, hueHistogram.reduce((sum, value) => sum + value, 0));
+  const pixelTotal = Math.max(1, count);
+  return [
+    ...hueHistogram.map(value => value / total * 3),
+    ...saturationBands.map(value => value / total * 1.5),
+    ...valueBands.map(value => value / total * 1.2),
+    red / pixelTotal,
+    green / pixelTotal,
+    blue / pixelTotal,
+    saturationSum / pixelTotal,
+    valueSum / pixelTotal,
+    Math.min(1, count / (size * size * 0.55))
+  ];
+}
+
+function rgbToHsv(r, g, b) {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const delta = max - min;
+  let h = 0;
+  if (delta > 0) {
+    if (max === rn) h = ((gn - bn) / delta) % 6;
+    else if (max === gn) h = (bn - rn) / delta + 2;
+    else h = (rn - gn) / delta + 4;
+    h /= 6;
+    if (h < 0) h += 1;
+  }
+  const s = max === 0 ? 0 : delta / max;
+  return [h, s, max];
 }
 
 function isIconForegroundPixel(r, g, b) {
