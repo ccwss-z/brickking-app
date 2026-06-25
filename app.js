@@ -1,7 +1,7 @@
 const ROWS = 14;
 const COLS = 10;
 const CELL_COUNT = ROWS * COLS;
-const DEFAULT_THRESHOLD = 0.34;
+const DEFAULT_THRESHOLD = 0.42;
 const ANALYSIS_FEATURE_INSET = 0.07;
 const MODEL_DISTANCE_THRESHOLD = 0.18;
 const DEFAULT_CATEGORY_ID = "00000000-0000-0000-0000-000000000001";
@@ -1892,8 +1892,9 @@ function matchAtlas(sample, entries = state.atlas) {
   if (second) {
     const gap = second.distance - best.distance;
     const ratio = best.distance / Math.max(second.distance, 0.0001);
-    const strongAbsoluteMatch = best.distance <= Math.min(0.20, DEFAULT_THRESHOLD * 0.60);
-    if (!strongAbsoluteMatch && (gap < 0.02 || ratio > 0.94)) return null;
+    const strongAbsoluteMatch = best.distance <= 0.29 ||
+      (best.iconDistance != null && best.iconDistance <= 0.31 && best.pixelDistance <= 0.38);
+    if (!strongAbsoluteMatch && best.distance > 0.34 && (gap < 0.012 || ratio > 0.975)) return null;
   } else if (best.distance > Math.min(0.22, DEFAULT_THRESHOLD)) {
     return null;
   }
