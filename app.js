@@ -714,10 +714,10 @@ function insetAtlasCropRect(rect) {
 
 function cropAtlasTemplateTileContent(rect) {
   const cardSide = Math.min(rect.w, rect.h);
-  const insetX = cardSide * 0.035;
-  const insetTop = cardSide * 0.035;
+  const insetX = cardSide * 0.006;
+  const insetTop = cardSide * 0.070;
   const contentW = Math.max(1, cardSide - insetX * 2);
-  const contentH = Math.max(1, cardSide * 0.765);
+  const contentH = Math.max(1, cardSide * 0.860);
   return {
     x: rect.x + (rect.w - cardSide) / 2 + insetX,
     y: rect.y + insetTop,
@@ -1962,6 +1962,8 @@ function applyTileCountLimit(cellResults) {
   for (let pass = 0; pass < 8 && changed; pass++) {
     changed = false;
 
+    changed = repairSingletonTriplePairs(cellResults, counts) || changed;
+
     for (const [tileID, count] of Array.from(counts.entries())) {
       if (count <= MAX_SAME_TILE_COUNT) continue;
       const overflow = count - MAX_SAME_TILE_COUNT;
@@ -1989,6 +1991,51 @@ function applyTileCountLimit(cellResults) {
       }
     }
   }
+}
+
+function repairSingletonTriplePairs(cellResults, counts) {
+  let changed = false;
+  const singleIDs = Array.from(counts.entries())
+    .filter(([, count]) => count === 1)
+    .map(([tileID]) => tileID);
+  const tripleIDs = Array.from(counts.entries())
+    .filter(([, count]) => count === 3)
+    .map(([tileID]) => tileID);
+  if (!singleIDs.length || !tripleIDs.length) return false;
+
+  for (const singleID of singleIDs) {
+    if ((counts.get(singleID) || 0) !== 1) continue;
+    const result = cellResults.find(item => item.value === singleID);
+    if (!result?.candidates?.length) continue;
+
+    const current = result.candidates.find(candidate => candidate.id === singleID);
+    const currentDistance = current?.distance ?? currentTileDistance(result, singleID);
+    let best = null;
+
+    for (const tripleID of tripleIDs) {
+      if ((counts.get(tripleID) || 0) !== 3) continue;
+      const candidate = result.candidates.find(item => item.id === tripleID);
+      if (!candidate) continue;
+      const absoluteLimit = Math.max(DEFAULT_THRESHOLD, currentDistance + 0.18);
+      const isCloseEnough = candidate.distance <= absoluteLimit &&
+        (candidate.colorDistance == null || candidate.colorDistance <= COLOR_MISMATCH_DISTANCE + 0.12);
+      if (!isCloseEnough) continue;
+
+      const score = candidate.distance + Math.max(0, candidate.distance - currentDistance) * 0.35;
+      if (!best || score < best.score) {
+        best = { candidate, tripleID, score };
+      }
+    }
+
+    if (!best) continue;
+    result.value = best.tripleID;
+    result.confidence = Math.max(0, 1 - best.candidate.distance / DEFAULT_THRESHOLD);
+    counts.set(singleID, 0);
+    counts.set(best.tripleID, 4);
+    changed = true;
+  }
+
+  return changed;
 }
 
 function assignedResultsForTile(cellResults, tileID) {
@@ -2561,7 +2608,7 @@ function closeCorrectionPicker(backdrop) {
 
 function solveCurrentBoard() {
   const started = performance.now();
-  const solver = new Solver(10_000);
+  const solver = new Solver(60_000);
   const result = solver.solve(state.board);
   state.steps = result.steps;
   state.stepBoards = [state.board];
@@ -2620,6 +2667,13 @@ function describeMove(move) {
   return `按住 R${move.start.row + 1}C${move.start.col + 1}，向${directionLabel(move.direction)}拖动，消除目标 R${move.target.row + 1}C${move.target.col + 1}。`;
 }
 
+window.__brickkingDebug = () => ({
+  board: state.board.slice(),
+  steps: state.steps.slice(),
+  stepBoards: state.stepBoards.map(board => board.slice()),
+  atlas: state.atlas.map(entry => ({ id: entry.id, name: entry.name, category: entry.category }))
+});
+
 function advanceStep() {
   if (!state.steps.length) return;
   state.stepIndex = Math.min(state.steps.length - 1, state.stepIndex + 1);
@@ -2644,43 +2698,529 @@ function syncAutoNext() {
   }, seconds * 1000);
 }
 
+class SearchCache {
+  constructor() {
+    this.legal = new Map();
+    this.direct = new Map();
+    this.tileCounts = new Map();
+  }
+
+  legalMoves(board) {
+    const key = boardKey(board);
+    if (!this.legal.has(key)) this.legal.set(key, legalMoves(board));
+    return this.legal.get(key);
+  }
+
+  directMoves(board) {
+    const key = boardKey(board);
+    if (!this.direct.has(key)) this.direct.set(key, directMoves(board));
+    return this.direct.get(key);
+  }
+
+  tileCount(board) {
+    const key = boardKey(board);
+    if (!this.tileCounts.has(key)) this.tileCounts.set(key, tileCount(board));
+    return this.tileCounts.get(key);
+  }
+}
+
 class Solver {
-  constructor(timeLimitMs = 10_000) {
+  constructor(timeLimitMs = 30_000) {
     this.deadline = performance.now() + timeLimitMs;
+    this.cache = new SearchCache();
   }
 
   solve(initial) {
-    const strategies = ["balanced", "dragEarly", "directFirst", "mobility", "shortDrag"];
+    const strategies = ["balanced", "dragEarly", "directFirst", "mobility", "lowBranch", "shortDrag", "longDrag"];
     let best = { steps: [], board: initial, solved: false };
+
     for (const strategy of strategies) {
-      const run = this.solveGreedy(initial, strategy);
-      if (run.solved || run.steps.length > best.steps.length || tileCount(run.board) < tileCount(best.board)) best = run;
-      if (best.solved || performance.now() > this.deadline) break;
+      const run = this.solveGreedy(initial, strategy, { depth: 3, branch: 10 });
+      best = betterResult(run, best);
+      if (best.solved || performance.now() > this.deadline) return best;
     }
+
+    const seed = this.solveSeedBeam(initial);
+    best = betterResult(seed, best);
+    if (best.solved || performance.now() > this.deadline) return best;
+
+    const repairedSeed = this.repairFromPrefix(initial, best);
+    best = betterResult(repairedSeed, best);
+    if (best.solved || performance.now() > this.deadline) return best;
+
+    const beam = this.solveBeam(initial, best);
+    best = repairTail(betterResult(beam, best), this.cache);
+    best = betterResult(this.repairFromPrefix(initial, best), best);
     return best;
   }
 
-  solveGreedy(initial, strategy) {
+  solveGreedy(initial, strategy, options = {}) {
     let board = initial.slice();
     const visited = new Set([boardKey(board)]);
     const steps = [];
-    while (performance.now() < this.deadline && tileCount(board) > 0) {
-      const candidates = legalMoves(board)
-        .map(move => ({ move, board: applyMove(board, move) }))
-        .filter(next => next.board && !visited.has(boardKey(next.board)))
-        .sort((a, b) => scoreCandidate(b, strategy, steps.length + 1) - scoreCandidate(a, strategy, steps.length + 1));
+    const depth = options.depth || 2;
+    const branch = options.branch || 8;
+
+    while (performance.now() < this.deadline && this.cache.tileCount(board) > 0) {
+      const candidates = rankedNextStates(board, strategy, steps.length + 1, this.cache)
+        .filter(next => !visited.has(next.key));
       if (!candidates.length) break;
-      const chosen = candidates[0];
+
+      const chosen = chooseLookahead(candidates, visited, strategy, steps.length + 1, depth, branch, this.cache, this.deadline);
+      if (!chosen) break;
       steps.push(chosen.move);
       board = chosen.board;
-      visited.add(boardKey(board));
+      visited.add(chosen.key);
     }
-    return { steps, board, solved: tileCount(board) === 0 };
+    return { steps, board, solved: this.cache.tileCount(board) === 0 };
+  }
+
+  solveBeam(initial, seedBest) {
+    const beamStrategies = ["balanced", "dragBiased", "directBiased", "mobility", "lowBranch", "endgame"];
+    const initialKey = boardKey(initial);
+    let best = seedBest || { steps: [], board: initial, solved: false };
+    let frontier = beamStrategies.map(strategy => ({
+      board: initial,
+      key: initialKey,
+      steps: [],
+      strategy,
+      lastMove: null,
+      score: 0
+    }));
+    if (best.steps.length) {
+      for (const strategy of beamStrategies) {
+        frontier.push({
+          board: best.board,
+          key: boardKey(best.board),
+          steps: best.steps,
+          strategy,
+          lastMove: best.steps[best.steps.length - 1] || null,
+          score: nodeScore(best.board, best.steps, best.steps[best.steps.length - 1] || null, strategy, this.cache)
+        });
+      }
+    }
+    const seen = new Map([[initialKey, 0]]);
+    const exhausted = new Set();
+
+    while (frontier.length && performance.now() < this.deadline) {
+      const nextFrontier = [];
+      for (const node of frontier) {
+        if (performance.now() > this.deadline) break;
+        const remaining = this.cache.tileCount(node.board);
+        if (remaining === 0) return { steps: node.steps, board: node.board, solved: true };
+        if (node.steps.length > best.steps.length || remaining < this.cache.tileCount(best.board)) {
+          best = { steps: node.steps, board: node.board, solved: false };
+        }
+
+        const endgame = this.solveEndgame(node, exhausted);
+        if (endgame) return endgame;
+
+        const candidates = rankedBeamCandidates(node, seen, this.cache)
+          .slice(0, dynamicCandidateLimit(node.board, node.steps.length, this.cache));
+        for (const candidate of candidates) {
+          const nextSteps = node.steps.concat(candidate.move);
+          const nextNode = {
+            board: candidate.board,
+            key: candidate.key,
+            steps: nextSteps,
+            strategy: node.strategy,
+            lastMove: candidate.move,
+            score: nodeScore(candidate.board, nextSteps, candidate.move, node.strategy, this.cache)
+          };
+          nextFrontier.push(nextNode);
+        }
+      }
+      frontier = uniqueBestNodes(nextFrontier)
+        .sort((a, b) => b.score - a.score || a.key.localeCompare(b.key))
+        .slice(0, dynamicBeamWidth(best.board, this.cache));
+      for (const node of frontier) seen.set(node.key, node.steps.length);
+    }
+    return repairTail(best, this.cache);
+  }
+
+  solveSeedBeam(initial) {
+    const strategies = ["balanced", "dragBiased", "directBiased", "mobility", "lowBranch", "endgame"];
+    let best = { steps: [], board: initial, solved: false };
+
+    for (const strategy of strategies) {
+      if (performance.now() > this.deadline) break;
+      let frontier = [{
+        board: initial,
+        key: boardKey(initial),
+        steps: [],
+        strategy,
+        lastMove: null,
+        score: 0
+      }];
+      const seen = new Map([[boardKey(initial), 0]]);
+
+      while (frontier.length && performance.now() < this.deadline) {
+        const nextFrontier = [];
+        for (const node of frontier) {
+          if (performance.now() > this.deadline) break;
+          if (this.cache.tileCount(node.board) === 0) {
+            return { steps: node.steps, board: node.board, solved: true };
+          }
+          const candidates = rankedBeamCandidates(node, seen, this.cache)
+            .slice(0, dynamicCandidateLimit(node.board, node.steps.length, this.cache));
+          for (const candidate of candidates) {
+            const nextSteps = node.steps.concat(candidate.move);
+            const nextNode = {
+              board: candidate.board,
+              key: candidate.key,
+              steps: nextSteps,
+              strategy,
+              lastMove: candidate.move,
+              score: nodeScore(candidate.board, nextSteps, candidate.move, strategy, this.cache)
+            };
+            best = betterResult({ steps: nextSteps, board: candidate.board, solved: this.cache.tileCount(candidate.board) === 0 }, best);
+            if (best.solved) return best;
+            nextFrontier.push(nextNode);
+          }
+        }
+        frontier = uniqueBestNodes(nextFrontier)
+          .sort((a, b) => b.score - a.score || this.cache.tileCount(a.board) - this.cache.tileCount(b.board) || b.steps.length - a.steps.length)
+          .slice(0, dynamicSeedBeamWidth(best.board, this.cache));
+        for (const node of frontier) seen.set(node.key, node.steps.length);
+      }
+    }
+
+    return best;
+  }
+
+  repairFromPrefix(initial, seed) {
+    if (!seed || seed.solved || seed.steps.length < 8 || performance.now() > this.deadline) return seed;
+    let best = seed;
+    const retreatCounts = [4, 6, 10, 14, 18, 24, 30];
+    const strategies = ["balanced", "dragBiased", "directBiased", "mobility", "lowBranch", "endgame"];
+
+    for (const retreat of retreatCounts) {
+      if (performance.now() > this.deadline) break;
+      const prefixLength = Math.max(0, seed.steps.length - retreat);
+      const prefix = replayPrefix(initial, seed.steps, prefixLength);
+      if (!prefix) continue;
+      const blockedMove = seed.steps[prefixLength];
+
+      for (const strategy of strategies) {
+        if (performance.now() > this.deadline) break;
+        let frontier = [{
+          board: prefix.board,
+          key: boardKey(prefix.board),
+          steps: prefix.steps,
+          strategy,
+          lastMove: prefix.steps[prefix.steps.length - 1] || null,
+          score: nodeScore(prefix.board, prefix.steps, prefix.steps[prefix.steps.length - 1] || null, strategy, this.cache)
+        }];
+        const seen = new Map(prefix.seen.map((key, index) => [key, index]));
+
+        while (frontier.length && performance.now() < this.deadline) {
+          const nextFrontier = [];
+          for (const node of frontier) {
+            if (performance.now() > this.deadline) break;
+            if (this.cache.tileCount(node.board) === 0) {
+              return { steps: node.steps, board: node.board, solved: true };
+            }
+            let candidates = rankedBeamCandidates(node, seen, this.cache)
+              .slice(0, Math.max(24, dynamicCandidateLimit(node.board, node.steps.length, this.cache)));
+            if (node.steps.length === prefixLength && blockedMove) {
+              const blockedKey = JSON.stringify(blockedMove);
+              candidates = candidates.filter(candidate => JSON.stringify(candidate.move) !== blockedKey);
+            }
+            for (const candidate of candidates) {
+              const nextSteps = node.steps.concat(candidate.move);
+              const solved = this.cache.tileCount(candidate.board) === 0;
+              const candidateResult = { steps: nextSteps, board: candidate.board, solved };
+              best = betterResult(candidateResult, best);
+              if (solved) return candidateResult;
+
+              const tail = this.solveEndgame({
+                board: candidate.board,
+                steps: nextSteps,
+                strategy,
+                lastMove: candidate.move
+              }, new Set());
+              if (tail?.solved) return tail;
+
+              nextFrontier.push({
+                board: candidate.board,
+                key: candidate.key,
+                steps: nextSteps,
+                strategy,
+                lastMove: candidate.move,
+                score: nodeScore(candidate.board, nextSteps, candidate.move, strategy, this.cache)
+              });
+            }
+          }
+          frontier = uniqueBestNodes(nextFrontier)
+            .sort((a, b) => b.score - a.score || this.cache.tileCount(a.board) - this.cache.tileCount(b.board) || b.steps.length - a.steps.length)
+            .slice(0, dynamicSeedBeamWidth(best.board, this.cache));
+          for (const node of frontier) seen.set(node.key, node.steps.length);
+        }
+      }
+    }
+
+    return best;
+  }
+
+  solveEndgame(node, exhausted) {
+    const remaining = this.cache.tileCount(node.board);
+    if (remaining > 28 || performance.now() > this.deadline) return null;
+    const suffix = endgameDfs(node.board, this.cache, this.deadline, exhausted, 0, 18);
+    if (!suffix) return null;
+    const steps = node.steps.concat(suffix);
+    let board = node.board;
+    for (const move of suffix) board = applyMove(board, move);
+    return { steps, board, solved: this.cache.tileCount(board) === 0 };
   }
 }
 
 function legalMoves(board) {
   return [...directMoves(board), ...dragMoves(board)];
+}
+
+function betterResult(a, b) {
+  if (!b) return a;
+  if (!a) return b;
+  if (a.solved && !b.solved) return a;
+  if (!a.solved && b.solved) return b;
+  if (a.steps.length !== b.steps.length) return a.steps.length > b.steps.length ? a : b;
+  return tileCount(a.board) < tileCount(b.board) ? a : b;
+}
+
+function rankedNextStates(board, strategy, stepNumber, cache) {
+  return cache.legalMoves(board)
+    .map(move => {
+      const nextBoard = applyMove(board, move);
+      if (!nextBoard) return null;
+      return { move, board: nextBoard, key: boardKey(nextBoard) };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      const scoreDelta = fastCandidateScore(b, strategy, stepNumber, cache) - fastCandidateScore(a, strategy, stepNumber, cache);
+      if (scoreDelta) return scoreDelta;
+      return lexCompare(moveSortKey(a.move), moveSortKey(b.move));
+    });
+}
+
+function chooseLookahead(candidates, visited, strategy, stepNumber, depth, branch, cache, deadline) {
+  let best = null;
+  let bestScore = -Infinity;
+  for (const candidate of candidates.slice(0, branch)) {
+    if (performance.now() > deadline) break;
+    const score = fastCandidateScore(candidate, strategy, stepNumber, cache)
+      + lookaheadScore(candidate.board, visited, strategy, stepNumber + 1, depth - 1, branch, cache, deadline);
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best || candidates[0] || null;
+}
+
+function lookaheadScore(board, visited, strategy, stepNumber, depth, branch, cache, deadline) {
+  if (depth <= 0 || performance.now() > deadline) return boardValue(board, cache);
+  if (cache.tileCount(board) === 0) return 10_000_000;
+  const candidates = rankedNextStates(board, strategy, stepNumber, cache)
+    .filter(next => !visited.has(next.key))
+    .slice(0, branch);
+  if (!candidates.length) return boardValue(board, cache) - 250_000;
+
+  let best = -Infinity;
+  for (const candidate of candidates) {
+    if (performance.now() > deadline) break;
+    visited.add(candidate.key);
+    const score = fastCandidateScore(candidate, strategy, stepNumber, cache)
+      + 0.72 * lookaheadScore(candidate.board, visited, strategy, stepNumber + 1, depth - 1, Math.max(4, branch - 2), cache, deadline);
+    visited.delete(candidate.key);
+    if (score > best) best = score;
+  }
+  return best;
+}
+
+function boardValue(board, cache) {
+  const remaining = cache.tileCount(board);
+  if (remaining === 0) return 10_000_000;
+  const moves = cache.legalMoves(board).length;
+  const direct = cache.directMoves(board).length;
+  return (140 - remaining) * 650 + Math.min(moves, 160) * 22 + Math.min(direct, 80) * 18 - remaining * 8;
+}
+
+function fastCandidateScore(candidate, strategy, stepNumber, cache) {
+  const remaining = cache.tileCount(candidate.board);
+  const moves = cache.legalMoves(candidate.board).length;
+  const direct = cache.directMoves(candidate.board).length;
+  const drag = candidate.move.type === "drag";
+  const distance = dragDistance(candidate.move);
+  let score = (140 - remaining) * 520 + Math.min(moves, 140) * 9 + Math.min(direct, 70) * 6 - remaining * 4;
+
+  const preferDrag = strategy === "dragEarly" || (stepNumber >= 3 && stepNumber <= 20 && remaining >= 80);
+  if (drag && preferDrag) score += 260;
+  if (!drag && strategy === "directFirst") score += 260;
+  if (strategy === "mobility") score += Math.min(moves, 160) * 24;
+  if (strategy === "lowBranch") score -= Math.min(moves, 160) * 18;
+  if (strategy === "shortDrag" && drag) score += Math.max(0, 150 - distance * 20);
+  if (strategy === "longDrag" && drag) score += Math.min(distance, 8) * 30;
+  if (remaining < 50 && !drag) score += direct * 16;
+  if (moves === 0 && remaining > 0) score -= 500_000;
+  if (remaining === 0) score += 10_000_000;
+  return score;
+}
+
+function rankedBeamCandidates(node, seen, cache) {
+  const candidates = cache.legalMoves(node.board)
+    .map(move => {
+      const nextBoard = applyMove(node.board, move);
+      if (!nextBoard) return null;
+      const key = boardKey(nextBoard);
+      const previousDepth = seen.get(key);
+      if (previousDepth !== undefined && previousDepth > node.steps.length + 1) return null;
+      return { move, board: nextBoard, key };
+    })
+    .filter(Boolean);
+
+  return candidates.sort((a, b) => {
+    const scoreDelta = beamCandidateScore(b, node, cache) - beamCandidateScore(a, node, cache);
+    if (scoreDelta) return scoreDelta;
+    return lexCompare(moveSortKey(a.move), moveSortKey(b.move));
+  });
+}
+
+function uniqueBestNodes(nodes) {
+  const bestByKey = new Map();
+  for (const node of nodes) {
+    const existing = bestByKey.get(node.key);
+    if (!existing || node.score > existing.score || node.steps.length > existing.steps.length) {
+      bestByKey.set(node.key, node);
+    }
+  }
+  return Array.from(bestByKey.values());
+}
+
+function beamCandidateScore(candidate, node, cache) {
+  const remaining = cache.tileCount(candidate.board);
+  const moves = cache.legalMoves(candidate.board).length;
+  const direct = cache.directMoves(candidate.board).length;
+  const drag = candidate.move.type === "drag";
+  let score = node.steps.length * 10_000;
+  score += (140 - remaining) * 360;
+  score += Math.min(moves, 180) * 18;
+  score += Math.min(direct, 90) * 12;
+  score += lineDistanceScore(candidate.move) * 12;
+
+  switch (node.strategy) {
+    case "dragBiased":
+      if (drag) score += remaining >= 80 ? 900 : 220;
+      break;
+    case "directBiased":
+      if (!drag) score += remaining < 70 ? 700 : 180;
+      break;
+    case "mobility":
+      score += Math.min(moves, 180) * 30;
+      break;
+    case "lowBranch":
+      score -= Math.min(moves, 180) * 24;
+      score += Math.min(direct, 90) * 22;
+      break;
+    case "endgame":
+      if (remaining < 60) score += Math.min(direct, 90) * 45 + (140 - remaining) * 180;
+      break;
+    default:
+      if (!drag) score += 120;
+      break;
+  }
+
+  if (remaining < 50 && !drag) score += direct * 18;
+  if (moves === 0 && remaining > 0) score -= 500_000;
+  if (remaining === 0) score += 10_000_000;
+  return score;
+}
+
+function nodeScore(board, steps, lastMove, strategy, cache) {
+  const remaining = cache.tileCount(board);
+  const moves = cache.legalMoves(board).length;
+  const direct = cache.directMoves(board).length;
+  let score = steps.length * 11_000 + (140 - remaining) * 450 + Math.min(moves, 180) * 16 + Math.min(direct, 90) * 10;
+  if (lastMove?.type === "drag") score += remaining >= 80 ? 380 : 110;
+  if (strategy === "mobility") score += Math.min(moves, 180) * 22;
+  if (strategy === "lowBranch") score -= Math.min(moves, 180) * 14;
+  if (strategy === "endgame" && remaining < 60) score += Math.min(direct, 90) * 35;
+  if (remaining === 0) score += 10_000_000;
+  if (moves === 0 && remaining > 0) score -= 700_000;
+  return score;
+}
+
+function dynamicCandidateLimit(board, depth, cache) {
+  const remaining = cache.tileCount(board);
+  if (remaining <= 32) return 40;
+  if (remaining <= 60) return 32;
+  if (depth < 12) return 26;
+  return 20;
+}
+
+function dynamicBeamWidth(board, cache) {
+  const remaining = cache.tileCount(board);
+  if (remaining <= 32) return 760;
+  if (remaining <= 60) return 620;
+  if (remaining <= 90) return 460;
+  return 340;
+}
+
+function dynamicSeedBeamWidth(board, cache) {
+  const remaining = cache.tileCount(board);
+  if (remaining <= 32) return 360;
+  if (remaining <= 60) return 260;
+  return 120;
+}
+
+function replayPrefix(initial, steps, prefixLength) {
+  let board = initial.slice();
+  const replayed = [];
+  const seen = [boardKey(board)];
+  for (const move of steps.slice(0, prefixLength)) {
+    const next = applyMove(board, move);
+    if (!next) return null;
+    board = next;
+    replayed.push(move);
+    seen.push(boardKey(board));
+  }
+  return { board, steps: replayed, seen };
+}
+
+function endgameDfs(board, cache, deadline, exhausted, depth, maxDepth) {
+  if (performance.now() > deadline) return null;
+  const remaining = cache.tileCount(board);
+  if (remaining === 0) return [];
+  if (depth >= maxDepth) return null;
+
+  const key = boardKey(board);
+  if (exhausted.has(key)) return null;
+  const moves = rankedNextStates(board, "directFirst", depth + 1, cache);
+  for (const candidate of moves.slice(0, remaining <= 16 ? 36 : 24)) {
+    const suffix = endgameDfs(candidate.board, cache, deadline, exhausted, depth + 1, maxDepth);
+    if (suffix) return [candidate.move].concat(suffix);
+  }
+  exhausted.add(key);
+  return null;
+}
+
+function repairTail(result, cache) {
+  if (!result || result.solved) return result;
+  const remaining = cache.tileCount(result.board);
+  if (remaining > 32) return result;
+
+  const deadline = performance.now() + 1_500;
+  const exhausted = new Set();
+  const suffix = endgameDfs(result.board, cache, deadline, exhausted, 0, Math.ceil(remaining / 2) + 4);
+  if (!suffix) return result;
+
+  let board = result.board;
+  for (const move of suffix) {
+    const next = applyMove(board, move);
+    if (!next) return result;
+    board = next;
+  }
+  const steps = result.steps.concat(suffix);
+  return { steps, board, solved: cache.tileCount(board) === 0 };
 }
 
 function directMoves(board) {
@@ -2807,6 +3347,38 @@ function scoreCandidate(candidate, strategy, stepNumber) {
   if (strategy === "shortDrag" && drag) score += Math.max(0, 120 - candidate.move.distance * 20);
   if (tileCount(candidate.board) === 0) score += 1_000_000;
   return score;
+}
+
+function dragDistance(move) {
+  return move?.type === "drag" ? move.distance || 0 : 0;
+}
+
+function lineDistanceScore(move) {
+  if (move.type === "remove") {
+    return Math.abs(move.a.row - move.b.row) + Math.abs(move.a.col - move.b.col);
+  }
+  return Math.abs(move.start.row - move.target.row) + Math.abs(move.start.col - move.target.col) + (move.distance || 0);
+}
+
+function moveSortKey(move) {
+  if (move.type === "remove") {
+    return [0, idx(move.a.row, move.a.col), idx(move.b.row, move.b.col), 0];
+  }
+  return [1, idx(move.start.row, move.start.col), directionPriority(move.direction), move.distance || 0, idx(move.target.row, move.target.col)];
+}
+
+function directionPriority(direction) {
+  return { up: 0, left: 1, right: 2, down: 3 }[direction] ?? 9;
+}
+
+function lexCompare(a, b) {
+  const count = Math.max(a.length, b.length);
+  for (let i = 0; i < count; i++) {
+    const av = a[i] ?? 0;
+    const bv = b[i] ?? 0;
+    if (av !== bv) return av - bv;
+  }
+  return 0;
 }
 
 function isBehind(target, held, direction) {
