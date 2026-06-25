@@ -1941,8 +1941,8 @@ function rankAtlasMatches(sample, entries = state.atlas) {
       ? rms(colorFeature, entry.colorFeature)
       : null;
     const fallbackDistance = iconDistance == null
-      ? fingerprintDistance * 0.40 + pixelDistance * 0.24 + (colorDistance ?? fingerprintDistance) * 0.36
-      : iconDistance * 0.46 + (colorDistance ?? iconDistance) * 0.32 + pixelDistance * 0.14 + fingerprintDistance * 0.08;
+      ? fingerprintDistance * 0.42 + pixelDistance * 0.38 + (colorDistance ?? fingerprintDistance) * 0.20
+      : pixelDistance * 0.42 + fingerprintDistance * 0.24 + iconDistance * 0.24 + (colorDistance ?? iconDistance) * 0.10;
     const embeddingDistance = embedding && entry.embedding ? cosineDistance(embedding, entry.embedding) : null;
     const distance = embeddingDistance == null ? fallbackDistance : Math.min(1, fallbackDistance) * 0.90 + embeddingDistance * 0.10;
     matches.push({ id: entry.id, entry, distance, fingerprintDistance, pixelDistance, iconDistance, colorDistance, embeddingDistance });
