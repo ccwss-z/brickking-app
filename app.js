@@ -5,7 +5,10 @@ const DEFAULT_THRESHOLD = 0.42;
 const ANALYSIS_FEATURE_INSET = 0.07;
 const MODEL_DISTANCE_THRESHOLD = 0.18;
 const MAX_SAME_TILE_COUNT = 4;
+const VALID_TILE_COUNTS = new Set([2, 4]);
 const MATCH_CANDIDATE_LIMIT = 8;
+const WEAK_MATCH_DISTANCE = 0.34;
+const WEAK_QUARTET_DISTANCE_GAP = 0.045;
 const DEFAULT_CATEGORY_ID = "00000000-0000-0000-0000-000000000001";
 const ATLAS_STORAGE_KEY = "brickking-pwa-atlas-v2";
 const ATLAS_PAGE_SIZE = 20;
@@ -1773,10 +1776,21 @@ async function recognizeBoard() {
           index,
           value: match.id,
           confidence: Math.max(0, 1 - match.distance / DEFAULT_THRESHOLD),
-          candidates
+          candidates,
+          sampleFeature: feature,
+          samplePixelFeature: pixelFeature,
+          sampleIconFeature: iconFeature
         });
       } else {
-        cellResults.push({ index, value: 1_000_000 + index, confidence: 0, candidates });
+        cellResults.push({
+          index,
+          value: 1_000_000 + index,
+          confidence: 0,
+          candidates,
+          sampleFeature: feature,
+          samplePixelFeature: pixelFeature,
+          sampleIconFeature: iconFeature
+        });
       }
     }
   }
@@ -1914,39 +1928,107 @@ function firstAcceptedAtlasMatch(matches) {
 function applyTileCountLimit(cellResults) {
   const counts = tileCounts(cellResults);
   let changed = true;
-  for (let pass = 0; pass < 4 && changed; pass++) {
+  for (let pass = 0; pass < 8 && changed; pass++) {
     changed = false;
-    for (const [tileID, count] of counts.entries()) {
+
+    for (const [tileID, count] of Array.from(counts.entries())) {
       if (count <= MAX_SAME_TILE_COUNT) continue;
       const overflow = count - MAX_SAME_TILE_COUNT;
-      const assigned = cellResults
-        .filter(result => result.value === tileID)
-        .sort((a, b) => {
-          const ad = a.candidates?.find(candidate => candidate.id === tileID)?.distance ?? 1;
-          const bd = b.candidates?.find(candidate => candidate.id === tileID)?.distance ?? 1;
-          return bd - ad;
-        });
+      const assigned = assignedResultsForTile(cellResults, tileID);
       for (const result of assigned.slice(0, overflow)) {
-        const replacement = result.candidates.find(candidate => {
-          if (candidate.id === tileID) return false;
-          if ((counts.get(candidate.id) || 0) >= MAX_SAME_TILE_COUNT) return false;
-          if (candidate.distance > DEFAULT_THRESHOLD) return false;
-          const current = result.candidates.find(item => item.id === tileID);
-          return !current || candidate.distance <= current.distance + 0.16;
-        });
-        counts.set(tileID, (counts.get(tileID) || 1) - 1);
-        if (replacement) {
-          result.value = replacement.id;
-          result.confidence = Math.max(0, 1 - replacement.distance / DEFAULT_THRESHOLD);
-          counts.set(replacement.id, (counts.get(replacement.id) || 0) + 1);
-        } else {
-          result.value = 1_000_000 + result.index;
-          result.confidence = 0;
-        }
-        changed = true;
+        changed = reassignOrUnknown(result, tileID, counts) || changed;
+      }
+    }
+
+    for (const [tileID, count] of Array.from(counts.entries())) {
+      if (count <= 0 || VALID_TILE_COUNTS.has(count)) continue;
+      const removeCount = count % 2 === 1 ? 1 : Math.max(0, count - MAX_SAME_TILE_COUNT);
+      const assigned = assignedResultsForTile(cellResults, tileID);
+      for (const result of assigned.slice(0, removeCount)) {
+        changed = reassignOrUnknown(result, tileID, counts) || changed;
+      }
+    }
+
+    for (const [tileID, count] of Array.from(counts.entries())) {
+      if (count !== MAX_SAME_TILE_COUNT) continue;
+      const assigned = assignedResultsForTile(cellResults, tileID);
+      if (!looksLikeMixedQuartet(assigned, tileID)) continue;
+      for (const result of assigned.slice(0, 2)) {
+        changed = reassignOrUnknown(result, tileID, counts) || changed;
       }
     }
   }
+}
+
+function assignedResultsForTile(cellResults, tileID) {
+  return cellResults
+    .filter(result => result.value === tileID)
+    .sort((a, b) => currentTileDistance(b, tileID) - currentTileDistance(a, tileID));
+}
+
+function currentTileDistance(result, tileID) {
+  return result.candidates?.find(candidate => candidate.id === tileID)?.distance ?? 1;
+}
+
+function reassignOrUnknown(result, oldTileID, counts) {
+  const replacement = result.candidates.find(candidate => {
+    if (candidate.id === oldTileID) return false;
+    if ((counts.get(candidate.id) || 0) >= MAX_SAME_TILE_COUNT) return false;
+    if (candidate.distance > DEFAULT_THRESHOLD) return false;
+    const current = result.candidates.find(item => item.id === oldTileID);
+    return !current || candidate.distance <= current.distance + 0.14;
+  });
+  counts.set(oldTileID, Math.max(0, (counts.get(oldTileID) || 1) - 1));
+  if (replacement) {
+    result.value = replacement.id;
+    result.confidence = Math.max(0, 1 - replacement.distance / DEFAULT_THRESHOLD);
+    counts.set(replacement.id, (counts.get(replacement.id) || 0) + 1);
+  } else {
+    result.value = 1_000_000 + result.index;
+    result.confidence = 0;
+  }
+  return true;
+}
+
+function looksLikeMixedQuartet(assigned, tileID) {
+  if (assigned.length !== MAX_SAME_TILE_COUNT) return false;
+  const sorted = [...assigned].sort((a, b) => currentTileDistance(a, tileID) - currentTileDistance(b, tileID));
+  const distances = sorted.map(result => currentTileDistance(result, tileID));
+  const weakTail = distances[2] > WEAK_MATCH_DISTANCE && distances[3] > WEAK_MATCH_DISTANCE;
+  const clearDistanceJump = distances[2] - distances[1] > WEAK_QUARTET_DISTANCE_GAP;
+  if (weakTail && clearDistanceJump) return true;
+
+  const head = sorted.slice(0, 2);
+  const tail = sorted.slice(2);
+  const headDistance = averagePairDistance(head);
+  const tailDistance = averagePairDistance(tail);
+  const crossDistance = averageCrossDistance(head, tail);
+  return distances[2] > WEAK_MATCH_DISTANCE &&
+    headDistance < 0.25 &&
+    tailDistance < 0.25 &&
+    crossDistance > Math.max(headDistance, tailDistance) + 0.12;
+}
+
+function averagePairDistance(results) {
+  if (results.length < 2) return 0;
+  return sampleDistance(results[0], results[1]);
+}
+
+function averageCrossDistance(left, right) {
+  const values = [];
+  for (const a of left) {
+    for (const b of right) {
+      values.push(sampleDistance(a, b));
+    }
+  }
+  return average(values);
+}
+
+function sampleDistance(a, b) {
+  if (a.sampleIconFeature && b.sampleIconFeature) return rms(a.sampleIconFeature, b.sampleIconFeature);
+  if (a.samplePixelFeature && b.samplePixelFeature) return rms(a.samplePixelFeature, b.samplePixelFeature);
+  if (a.sampleFeature && b.sampleFeature) return rms(a.sampleFeature, b.sampleFeature);
+  return 0;
 }
 
 function tileCounts(cellResults) {
