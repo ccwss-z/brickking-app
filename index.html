@@ -10,7 +10,7 @@
   <title>砖王</title>
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="apple-touch-icon" href="./icons/icon-152.png">
-  <link rel="stylesheet" href="./styles.css?v=20260624-model1">
+  <link rel="stylesheet" href="./styles.css?v=20260625-interactions">
 </head>
 <body>
   <main class="app-shell">
@@ -105,14 +105,26 @@
             <button id="savePreviewButton" class="soft-button" type="button" disabled>保存预览</button>
           </div>
 
-          <button id="uploadComputerButton" class="computer-button" type="button" hidden>上传电脑端</button>
-
           <label class="primary-solid file-button">
             <input id="imageInput" type="file" accept="image/*">
             <span id="uploadButtonText">上传截图</span>
           </label>
 
           <button id="solveButton" class="primary-solid" type="button" disabled>开始分析</button>
+          <div id="analysisProgress" class="analysis-progress" hidden>
+            <div>
+              <span>已分析</span>
+              <strong id="analysisVisited">0</strong>
+            </div>
+            <div>
+              <span>目前步数</span>
+              <strong id="analysisSteps">0</strong>
+            </div>
+            <div>
+              <span>剩余砖块</span>
+              <strong id="analysisRemaining">0</strong>
+            </div>
+          </div>
           <p id="statusText" class="panel-note">先上传截图，砖王会自动切出 14 x 10 棋盘。</p>
         </div>
 
@@ -249,6 +261,6 @@
     <button class="cell" type="button"></button>
   </template>
 
-  <script src="./app.js?v=20260624-model1" type="module"></script>
+  <script src="./app.js?v=20260625-interactions" type="module"></script>
 </body>
 </html>

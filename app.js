@@ -57,6 +57,10 @@ const els = {
   stepBoard: $("#stepBoard"),
   statusText: $("#statusText"),
   warningMessage: $("#warningMessage"),
+  analysisProgress: $("#analysisProgress"),
+  analysisVisited: $("#analysisVisited"),
+  analysisSteps: $("#analysisSteps"),
+  analysisRemaining: $("#analysisRemaining"),
   recognizeButton: $("#recognizeButton"),
   solveButton: $("#solveButton"),
   uploadButtonText: $("#uploadButtonText"),
@@ -88,7 +92,6 @@ const els = {
   atlasScreenshotInput: $("#atlasScreenshotInput"),
   tileCountBadge: $("#tileCountBadge"),
   atlasCategorySelect: $("#atlasCategorySelect"),
-  uploadComputerButton: $("#uploadComputerButton"),
   autoNextToggle: $("#autoNextToggle"),
   autoNextSeconds: $("#autoNextSeconds"),
   autoNextPauseButton: $("#autoNextPauseButton"),
@@ -2550,6 +2553,9 @@ function colorHistogram(values, bins) {
 function renderBoard(container, board, options = {}) {
   container.innerHTML = "";
   const template = $("#cellTemplate");
+  const dragMove = options.dragMove?.type === "drag" ? options.dragMove : null;
+  const dragTransforms = dragMove ? dragAnimationTransforms(board, dragMove) : new Map();
+  const dragStartIndex = dragMove ? idx(dragMove.start.row, dragMove.start.col) : -1;
   for (let i = 0; i < CELL_COUNT; i++) {
     const value = board[i] || 0;
     const cell = template.content.firstElementChild.cloneNode(true);
@@ -2570,11 +2576,65 @@ function renderBoard(container, board, options = {}) {
     if (options.highlights?.has(i)) {
       cell.classList.add("highlight");
     }
+    if (dragTransforms.has(i)) {
+      cell.classList.add("drag-train");
+      cell.style.setProperty("--drag-transform", dragTransforms.get(i));
+      if (i === dragStartIndex) {
+        cell.classList.add("drag-source");
+      }
+    }
     if (options.editable) {
       cell.addEventListener("click", () => openCorrectionPicker(i));
     }
     container.appendChild(cell);
   }
+  if (dragMove) {
+    container.appendChild(createDragPathOverlay(dragMove));
+  }
+}
+
+function dragAnimationTransforms(board, move) {
+  const transforms = new Map();
+  const train = dragTrain(board, move.start, move.direction);
+  const moveDelta = delta(move.direction);
+  const distance = Math.max(1, move.distance || 1);
+  for (const position of train) {
+    const index = idx(position.row, position.col);
+    transforms.set(index, `translate(${moveDelta.col * distance * 108}%, ${moveDelta.row * distance * 108}%)`);
+  }
+  return transforms;
+}
+
+function directionArrow(direction) {
+  switch (direction) {
+    case "up": return "↑";
+    case "down": return "↓";
+    case "left": return "←";
+    case "right": return "→";
+    default: return "";
+  }
+}
+
+function createDragPathOverlay(move) {
+  const moveDelta = delta(move.direction);
+  const distance = Math.max(1, move.distance || 1);
+  const end = {
+    row: clamp(move.start.row + moveDelta.row * distance, 0, ROWS - 1),
+    col: clamp(move.start.col + moveDelta.col * distance, 0, COLS - 1)
+  };
+  const startX = ((move.start.col + 0.5) / COLS) * 100;
+  const startY = ((move.start.row + 0.5) / ROWS) * 100;
+  const endX = ((end.col + 0.5) / COLS) * 100;
+  const endY = ((end.row + 0.5) / ROWS) * 100;
+  const overlay = document.createElement("div");
+  overlay.className = "drag-path-overlay";
+  overlay.innerHTML = `
+    <svg class="drag-path-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+      <line class="drag-path-line" x1="${startX}" y1="${startY}" x2="${endX}" y2="${endY}"></line>
+    </svg>
+    <span class="drag-path-arrow drag-arrow" style="left:${endX}%; top:${endY}%;">${directionArrow(move.direction)}</span>
+  `;
+  return overlay;
 }
 
 function openCorrectionPicker(index) {
@@ -2622,29 +2682,74 @@ function closeCorrectionPicker(backdrop) {
   }
 }
 
-function solveCurrentBoard() {
+async function solveCurrentBoard() {
   const started = performance.now();
-  const solver = new Solver(60_000);
-  const result = solver.solve(state.board);
-  state.steps = result.steps;
-  state.stepBoards = [state.board];
-  let cursor = state.board;
-  for (const move of state.steps) {
-    cursor = applyMove(cursor, move) || cursor;
-    state.stepBoards.push(cursor);
+  setAnalysisProgress({
+    visible: true,
+    analyzed: 0,
+    steps: 0,
+    remaining: tileCount(state.board)
+  });
+  setStatus("正在分析", "正在搜索可走路径...");
+  els.solveButton.disabled = true;
+  if (els.recognizeButton) els.recognizeButton.disabled = true;
+  const solver = new Solver(60_000, progress => setAnalysisProgress({ visible: true, ...progress }));
+  try {
+    const result = await solver.solve(state.board);
+    state.steps = result.steps;
+    state.stepBoards = [state.board];
+    let cursor = state.board;
+    for (const move of state.steps) {
+      cursor = applyMove(cursor, move) || cursor;
+      state.stepBoards.push(cursor);
+    }
+    state.stepIndex = 0;
+    setStatus(result.solved ? "找到通关步骤" : "已返回最多步骤", `步骤 ${state.steps.length}，用时 ${((performance.now() - started) / 1000).toFixed(1)} 秒。`);
+    setAnalysisProgress({
+      visible: true,
+      analyzed: solver.analyzed,
+      steps: state.steps.length,
+      remaining: tileCount(result.board)
+    });
+    els.resultTitle.textContent = result.solved ? "通关步骤" : "最多可走步骤";
+    els.resultSubtitle.textContent = result.solved
+      ? "已找到完整通关路径。"
+      : "已返回当前最好方案，剩余仍可能继续消除。";
+    els.resultReason.textContent = result.solved
+      ? "已找到完整通关方案。"
+      : "已返回当前最好方案；剩余仍可能继续消除。";
+    showResult(true);
+    renderStep();
+    syncAutoNext();
+  } catch (error) {
+    console.error(error);
+    setStatus("分析失败", "分析过程中出错，请返回校正后重试。");
+  } finally {
+    els.solveButton.disabled = tileCount(state.board) === 0;
+    if (els.recognizeButton) els.recognizeButton.disabled = !state.image;
   }
-  state.stepIndex = 0;
-  setStatus(result.solved ? "找到通关步骤" : "已返回最多步骤", `步骤 ${state.steps.length}，用时 ${((performance.now() - started) / 1000).toFixed(1)} 秒。`);
-  els.resultTitle.textContent = result.solved ? "通关步骤" : "最多可走步骤";
-  els.resultSubtitle.textContent = result.solved
-    ? "已找到完整通关路径。"
-    : "已返回当前最好方案，剩余仍可能继续消除。";
-  els.resultReason.textContent = result.solved
-    ? "已找到完整通关方案。"
-    : "已返回当前最好方案；剩余仍可能继续消除。";
-  showResult(true);
-  renderStep();
-  syncAutoNext();
+}
+
+function setAnalysisProgress({ visible = false, analyzed = 0, steps = 0, remaining = 0 } = {}) {
+  if (!els.analysisProgress) return;
+  els.analysisProgress.hidden = !visible;
+  els.analysisVisited.textContent = formatCount(analyzed);
+  els.analysisSteps.textContent = formatCount(steps);
+  els.analysisRemaining.textContent = formatCount(remaining);
+}
+
+function formatCount(value) {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)).toLocaleString("zh-CN") : "0";
+}
+
+function nextUiFrame() {
+  return new Promise(resolve => {
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => resolve());
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
 }
 
 function renderStep() {
@@ -2661,7 +2766,10 @@ function renderStep() {
   els.stepTitle.textContent = move.type === "remove" ? "直接点掉两块" : `向${directionLabel(move.direction)}拖 ${move.distance} 格`;
   els.stepDescription.textContent = describeMove(move);
   const board = state.stepBoards[state.stepIndex] || state.board;
-  renderBoard(els.stepBoard, board, { highlights: highlightedIndexes(move) });
+  renderBoard(els.stepBoard, board, {
+    highlights: highlightedIndexes(move),
+    dragMove: move.type === "drag" ? move : null
+  });
 }
 
 function highlightedIndexes(move) {
@@ -2690,6 +2798,11 @@ window.__brickkingDebug = () => ({
   stepBoards: state.stepBoards.map(board => board.slice()),
   atlas: state.atlas.map(entry => ({ id: entry.id, name: entry.name, category: entry.category }))
 });
+
+window.__brickkingDebugSetStep = index => {
+  state.stepIndex = clamp(Number(index) || 0, 0, Math.max(0, state.steps.length - 1));
+  renderStep();
+};
 
 function advanceStep() {
   if (!state.steps.length) return;
@@ -2742,36 +2855,44 @@ class SearchCache {
 }
 
 class Solver {
-  constructor(timeLimitMs = 30_000) {
+  constructor(timeLimitMs = 30_000, onProgress = null) {
     this.deadline = performance.now() + timeLimitMs;
     this.cache = new SearchCache();
+    this.onProgress = onProgress;
+    this.analyzed = 0;
+    this.lastProgressAt = 0;
   }
 
-  solve(initial) {
+  async solve(initial) {
     const strategies = ["balanced", "dragEarly", "directFirst", "mobility", "lowBranch", "shortDrag", "longDrag"];
     let best = { steps: [], board: initial, solved: false };
+    await this.report(initial, 0, true);
 
     for (const strategy of strategies) {
-      const run = this.solveGreedy(initial, strategy, { depth: 3, branch: 10 });
+      const run = await this.solveGreedy(initial, strategy, { depth: 3, branch: 10 });
       best = betterResult(run, best);
+      await this.report(best.board, best.steps.length, true);
       if (best.solved || performance.now() > this.deadline) return best;
     }
 
-    const seed = this.solveSeedBeam(initial);
+    const seed = await this.solveSeedBeam(initial);
     best = betterResult(seed, best);
+    await this.report(best.board, best.steps.length, true);
     if (best.solved || performance.now() > this.deadline) return best;
 
-    const repairedSeed = this.repairFromPrefix(initial, best);
+    const repairedSeed = await this.repairFromPrefix(initial, best);
     best = betterResult(repairedSeed, best);
+    await this.report(best.board, best.steps.length, true);
     if (best.solved || performance.now() > this.deadline) return best;
 
-    const beam = this.solveBeam(initial, best);
+    const beam = await this.solveBeam(initial, best);
     best = repairTail(betterResult(beam, best), this.cache);
-    best = betterResult(this.repairFromPrefix(initial, best), best);
+    best = betterResult(await this.repairFromPrefix(initial, best), best);
+    await this.report(best.board, best.steps.length, true);
     return best;
   }
 
-  solveGreedy(initial, strategy, options = {}) {
+  async solveGreedy(initial, strategy, options = {}) {
     let board = initial.slice();
     const visited = new Set([boardKey(board)]);
     const steps = [];
@@ -2779,6 +2900,7 @@ class Solver {
     const branch = options.branch || 8;
 
     while (performance.now() < this.deadline && this.cache.tileCount(board) > 0) {
+      await this.report(board, steps.length);
       const candidates = rankedNextStates(board, strategy, steps.length + 1, this.cache)
         .filter(next => !visited.has(next.key));
       if (!candidates.length) break;
@@ -2788,11 +2910,12 @@ class Solver {
       steps.push(chosen.move);
       board = chosen.board;
       visited.add(chosen.key);
+      await this.report(board, steps.length, steps.length % 4 === 0);
     }
     return { steps, board, solved: this.cache.tileCount(board) === 0 };
   }
 
-  solveBeam(initial, seedBest) {
+  async solveBeam(initial, seedBest) {
     const beamStrategies = ["balanced", "dragBiased", "directBiased", "mobility", "lowBranch", "endgame"];
     const initialKey = boardKey(initial);
     let best = seedBest || { steps: [], board: initial, solved: false };
@@ -2823,10 +2946,12 @@ class Solver {
       const nextFrontier = [];
       for (const node of frontier) {
         if (performance.now() > this.deadline) break;
+        await this.report(node.board, node.steps.length);
         const remaining = this.cache.tileCount(node.board);
         if (remaining === 0) return { steps: node.steps, board: node.board, solved: true };
         if (node.steps.length > best.steps.length || remaining < this.cache.tileCount(best.board)) {
           best = { steps: node.steps, board: node.board, solved: false };
+          await this.report(best.board, best.steps.length, true);
         }
 
         const endgame = this.solveEndgame(node, exhausted);
@@ -2855,7 +2980,7 @@ class Solver {
     return repairTail(best, this.cache);
   }
 
-  solveSeedBeam(initial) {
+  async solveSeedBeam(initial) {
     const strategies = ["balanced", "dragBiased", "directBiased", "mobility", "lowBranch", "endgame"];
     let best = { steps: [], board: initial, solved: false };
 
@@ -2875,6 +3000,7 @@ class Solver {
         const nextFrontier = [];
         for (const node of frontier) {
           if (performance.now() > this.deadline) break;
+          await this.report(node.board, node.steps.length);
           if (this.cache.tileCount(node.board) === 0) {
             return { steps: node.steps, board: node.board, solved: true };
           }
@@ -2891,6 +3017,9 @@ class Solver {
               score: nodeScore(candidate.board, nextSteps, candidate.move, strategy, this.cache)
             };
             best = betterResult({ steps: nextSteps, board: candidate.board, solved: this.cache.tileCount(candidate.board) === 0 }, best);
+            if (best.steps.length === nextSteps.length) {
+              await this.report(best.board, best.steps.length, best.steps.length % 5 === 0);
+            }
             if (best.solved) return best;
             nextFrontier.push(nextNode);
           }
@@ -2905,7 +3034,7 @@ class Solver {
     return best;
   }
 
-  repairFromPrefix(initial, seed) {
+  async repairFromPrefix(initial, seed) {
     if (!seed || seed.solved || seed.steps.length < 8 || performance.now() > this.deadline) return seed;
     let best = seed;
     const retreatCounts = [4, 6, 10, 14, 18, 24, 30];
@@ -2934,6 +3063,7 @@ class Solver {
           const nextFrontier = [];
           for (const node of frontier) {
             if (performance.now() > this.deadline) break;
+            await this.report(node.board, node.steps.length);
             if (this.cache.tileCount(node.board) === 0) {
               return { steps: node.steps, board: node.board, solved: true };
             }
@@ -2948,6 +3078,9 @@ class Solver {
               const solved = this.cache.tileCount(candidate.board) === 0;
               const candidateResult = { steps: nextSteps, board: candidate.board, solved };
               best = betterResult(candidateResult, best);
+              if (best.steps.length === nextSteps.length) {
+                await this.report(best.board, best.steps.length, best.steps.length % 5 === 0);
+              }
               if (solved) return candidateResult;
 
               const tail = this.solveEndgame({
@@ -2977,6 +3110,21 @@ class Solver {
     }
 
     return best;
+  }
+
+  async report(board, stepsLength, force = false) {
+    this.analyzed += 1;
+    const now = performance.now();
+    if (!force && now - this.lastProgressAt < 120) return;
+    this.lastProgressAt = now;
+    if (this.onProgress) {
+      this.onProgress({
+        analyzed: this.analyzed,
+        steps: stepsLength,
+        remaining: this.cache.tileCount(board)
+      });
+    }
+    await nextUiFrame();
   }
 
   solveEndgame(node, exhausted) {

@@ -282,6 +282,7 @@ h4 {
 }
 
 .board-wrap {
+  position: relative;
   display: grid;
   grid-template-columns: repeat(10, minmax(0, 1fr));
   gap: 4px;
@@ -319,6 +320,64 @@ h4 {
 .cell.highlight {
   outline: 3px solid #ff7048;
   box-shadow: 0 0 0 4px rgba(255, 112, 72, .20);
+}
+
+.cell.drag-train {
+  z-index: 3;
+  animation: brick-drag 1.15s ease-in-out infinite alternate;
+  box-shadow: 0 8px 18px rgba(255, 138, 76, .25);
+}
+
+.cell.drag-source {
+  overflow: visible;
+}
+
+.drag-path-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 20;
+}
+
+.drag-path-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.drag-path-line {
+  stroke: #ff4141;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+  filter: drop-shadow(0 4px 8px rgba(255, 65, 65, .22));
+}
+
+.drag-path-arrow {
+  position: absolute;
+  width: clamp(34px, 8vw, 48px);
+  height: clamp(34px, 8vw, 48px);
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #ff4141;
+  color: #fff;
+  font-size: clamp(24px, 6vw, 34px);
+  font-weight: 950;
+  border: 4px solid #fff;
+  box-shadow: 0 10px 24px rgba(255, 65, 65, .30);
+  transform: translate(-50%, -50%);
+}
+
+@keyframes brick-drag {
+  from {
+    transform: translate(0, 0) scale(1);
+  }
+  to {
+    transform: var(--drag-transform) scale(1.03);
+  }
 }
 
 .instruction-card {
@@ -407,7 +466,6 @@ h4 {
 .soft-button,
 .danger-button,
 .plain-button,
-.computer-button,
 .atlas-action {
   min-height: 48px;
   border: 0;
@@ -427,11 +485,6 @@ h4 {
 
 .primary-solid {
   background: var(--black);
-  color: #fff;
-}
-
-.computer-button {
-  background: var(--blue);
   color: #fff;
 }
 
@@ -461,6 +514,41 @@ h4 {
 .soft-button:disabled,
 .atlas-action:disabled {
   opacity: .42;
+}
+
+.analysis-progress {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 8px;
+  border-radius: 16px;
+  background: #f7f4ed;
+  border: 1px solid rgba(32, 31, 28, .06);
+}
+
+.analysis-progress[hidden] {
+  display: none;
+}
+
+.analysis-progress div {
+  display: grid;
+  gap: 3px;
+  padding: 8px 6px;
+  border-radius: 12px;
+  background: #fff;
+  text-align: center;
+}
+
+.analysis-progress span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.analysis-progress strong {
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 950;
 }
 
 .panel-note,
@@ -955,7 +1043,6 @@ h4 {
   .soft-button,
   .danger-button,
   .plain-button,
-  .computer-button,
   .atlas-action {
     min-height: 46px;
     padding: 0 12px;
