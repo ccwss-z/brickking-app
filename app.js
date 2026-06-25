@@ -667,7 +667,10 @@ async function prepareScreenshotTileImports(file) {
   const drafts = [];
   for (const rect of cells) {
     const cropRect = templateGrid ? cropAtlasTemplateTileContent(rect) : insetAtlasCropRect(rect);
-    const imageData = cropImageToDataURL(image, cropRect, 120, 120);
+    const imageData = cropImageToDataURL(image, cropRect, 120, 120, templateGrid ? {
+      fit: "contain",
+      background: "#eef8c8"
+    } : undefined);
     const tileImage = await loadImage(imageData);
     const name = nextAvailableAtlasName("图鉴", used);
     used.add(normalizeName(name));
@@ -711,15 +714,15 @@ function insetAtlasCropRect(rect) {
 
 function cropAtlasTemplateTileContent(rect) {
   const cardSide = Math.min(rect.w, rect.h);
-  const insetX = cardSide * 0.075;
-  const insetTop = cardSide * 0.055;
-  const insetBottom = cardSide * 0.19;
-  const contentSide = Math.max(1, cardSide - insetX * 2);
+  const insetX = cardSide * 0.035;
+  const insetTop = cardSide * 0.035;
+  const contentW = Math.max(1, cardSide - insetX * 2);
+  const contentH = Math.max(1, cardSide * 0.765);
   return {
     x: rect.x + (rect.w - cardSide) / 2 + insetX,
     y: rect.y + insetTop,
-    w: contentSide,
-    h: Math.max(1, cardSide - insetTop - insetBottom)
+    w: contentW,
+    h: contentH
   };
 }
 
@@ -894,9 +897,24 @@ function cellRectsFromGrid(grid, rows = ROWS, cols = COLS) {
   return cells;
 }
 
-function cropImageToDataURL(image, rect, outW = 120, outH = 120) {
+function cropImageToDataURL(image, rect, outW = 120, outH = 120, options = {}) {
   const canvas = makeCanvas(outW, outH);
   const ctx = canvas.getContext("2d");
+  if (options.fit === "contain") {
+    ctx.fillStyle = options.background || "#eef8c8";
+    ctx.fillRect(0, 0, outW, outH);
+    const scale = Math.min(outW / rect.w, outH / rect.h);
+    const drawW = rect.w * scale;
+    const drawH = rect.h * scale;
+    const drawX = (outW - drawW) / 2;
+    const drawY = (outH - drawH) / 2;
+    ctx.drawImage(
+      image,
+      rect.x, rect.y, rect.w, rect.h,
+      drawX, drawY, drawW, drawH
+    );
+    return canvas.toDataURL("image/png");
+  }
   ctx.drawImage(
     image,
     rect.x, rect.y, rect.w, rect.h,
